@@ -20,6 +20,21 @@ public enum AnisetteKitLogging {
     public static func setLogging(_ enabled: Bool) {
         lock.withLock { isEnabled = enabled }
         anisetteCoreSetLogging(enabled ? 1 : 0)
+        #if os(Windows)
+        if enabled {
+            _putenv("UNICORN_LOG_LEVEL=0xFFFFFFFF")
+            _putenv("UNICORN_LOG_DETAIL_LEVEL=2")
+        } else {
+            _putenv("UNICORN_LOG_LEVEL=0")
+        }
+        #else
+        if enabled {
+            setenv("UNICORN_LOG_LEVEL", "0xFFFFFFFF", 1)
+            setenv("UNICORN_LOG_DETAIL_LEVEL", "2", 1)
+        } else {
+            setenv("UNICORN_LOG_LEVEL", "0", 1)
+        }
+        #endif
     }
 }
 
