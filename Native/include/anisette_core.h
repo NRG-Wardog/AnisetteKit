@@ -96,6 +96,13 @@ int32_t get_anisette_headers_uc(
     char **out_json
 );
 
+// V3_ISOLATED_ANISETTE_OTP_V1: caller supplies a private, existing temp root.
+// Never provisions. The identifier derivation is identical to the normal API.
+int32_t get_anisette_headers_isolated_uc(
+    const char *lib_dir, const char *provisioning_dir, const uint8_t *identifier,
+    const uint8_t *adi_pb, uint32_t adi_pb_len, char **out_json
+);
+
 int32_t start_provision_uc(
     const char *lib_dir,
     const char *provisioning_dir,

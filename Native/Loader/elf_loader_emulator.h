@@ -28,7 +28,8 @@
 #include <unicorn/unicorn.h>
 #include "anisette_base.h"
 
-#define LOG_UC(...) anisetteCoreLog(__VA_ARGS__)
+extern thread_local bool g_isolated_otp_logging_suppressed;
+#define LOG_UC(...) do { if (!g_isolated_otp_logging_suppressed) anisetteCoreLog(__VA_ARGS__); } while (0)
 
 static const uint64_t kReturnAddress = 0xDEAD0000;
 static const uint64_t kHeapAddress   = 0x48000000;
@@ -88,6 +89,7 @@ struct EmulatorVM {
         std::vector<std::string> needed_libs;
     };
 
+    bool read_only_filesystem = false;
     uc_engine *uc;
     PageAllocator heap;
     PageAllocator library_alloc;
@@ -106,7 +108,7 @@ struct EmulatorVM {
 
     std::vector<LibraryInfo> loaded_libraries;
 
-    EmulatorVM();
+    explicit EmulatorVM(bool checked = false);
     ~EmulatorVM();
 
     uint64_t register_import(const std::string &name);

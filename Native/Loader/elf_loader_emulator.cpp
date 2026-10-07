@@ -85,6 +85,8 @@ static inline int gettimeofday(struct timeval *tv, void *tz) {
 #include <unordered_map>
 #include <sstream>
 #include <random>
+#include <stdexcept>
+#include <memory>
 
 const AndroidSystemProperties kAndroidProperties;
 
@@ -158,7 +160,7 @@ uint64_t PageAllocator::alloc(uint64_t bytes) {
 static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
 static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data);
 
-EmulatorVM::EmulatorVM()
+EmulatorVM::EmulatorVM(bool checked)
     : uc(nullptr),
       heap(kHeapAddress, kHeapSize, 64),
       library_alloc(0x10000000, 0x30000000, 0x10000),
@@ -168,34 +170,44 @@ EmulatorVM::EmulatorVM()
     uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc);
     if (err != UC_ERR_OK) {
         LOG_UC("[Emulator] Failed on uc_open() with error returned: %u (%s)\n", err, uc_strerror(err));
+        if (checked) throw std::runtime_error("Isolated VM initialization failed");
         abort();
     }
 
-    uc_mem_map(uc, kHeapAddress, kHeapSize, UC_PROT_READ | UC_PROT_WRITE);
+    auto check = [&](uc_err result) {
+        if (checked && result != UC_ERR_OK) {
+            uc_close(uc); uc = nullptr;
+            throw std::runtime_error("Isolated VM initialization failed");
+        }
+    };
+    check(uc_mem_map(uc, kHeapAddress, kHeapSize, UC_PROT_READ | UC_PROT_WRITE));
 
-    uc_mem_map(uc, kStackAddress, kStackSize, UC_PROT_READ | UC_PROT_WRITE);
+    check(uc_mem_map(uc, kStackAddress, kStackSize, UC_PROT_READ | UC_PROT_WRITE));
 
-    uc_mem_map(uc, kImportAddress, kImportSize, UC_PROT_ALL);
+    check(uc_mem_map(uc, kImportAddress, kImportSize, UC_PROT_ALL));
 
-    uc_mem_map(uc, 0x0, 0x10000, UC_PROT_NONE);
+    check(uc_mem_map(uc, 0x0, 0x10000, UC_PROT_NONE));
 
     errno_addr = 0x3FF00000;
-    uc_mem_map(uc, errno_addr, 0x10000, UC_PROT_READ | UC_PROT_WRITE);
+    check(uc_mem_map(uc, errno_addr, 0x10000, UC_PROT_READ | UC_PROT_WRITE));
     uint32_t zero = 0;
-    uc_mem_write(uc, errno_addr, &zero, sizeof(zero));
+    check(uc_mem_write(uc, errno_addr, &zero, sizeof(zero)));
 
-    uc_hook_add(uc, &invalid_hook, UC_HOOK_MEM_UNMAPPED, (void *)hook_mem_invalid, this, 1, 0);
+    check(uc_hook_add(uc, &invalid_hook, UC_HOOK_MEM_UNMAPPED, (void *)hook_mem_invalid, this, 1, 0));
 
     uc_hook intr_hook = 0;
-    uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void *)hook_intr, this, 1, 0);
+    check(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void *)hook_intr, this, 1, 0));
 
-    uc_hook_add(uc, &import_hook, UC_HOOK_CODE, (void *)import_callback_router, this,
-                kImportAddress, kImportAddress + kImportSize - 1);
+    check(uc_hook_add(uc, &import_hook, UC_HOOK_CODE, (void *)import_callback_router, this,
+                kImportAddress, kImportAddress + kImportSize - 1));
 
-    uc_hook_add(uc, &pc_trace_hook, UC_HOOK_CODE, (void *)trace_pc_hook, this, 1, 0);
+    check(uc_hook_add(uc, &pc_trace_hook, UC_HOOK_CODE, (void *)trace_pc_hook, this, 1, 0));
 }
 
 EmulatorVM::~EmulatorVM() {
+    // V3_ISOLATED_ANISETTE_OTP_V1: dispose guest-owned host descriptors.
+    for (const auto &entry : fd_map) close(entry.second);
+    fd_map.clear();
     if (uc) {
         uc_close(uc);
         uc = nullptr;
@@ -427,6 +439,18 @@ static void hook_memchr(EmulatorVM *vm) {
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
 }
 
+// V3_ISOLATED_ANISETTE_OTP_V1: probe guests cannot mutate the host filesystem.
+// Staging occurs in the host wrapper before this VM is initialized. A native
+// operation requiring a write fails closed rather than weakening this policy.
+static bool deny_read_only_mutation(EmulatorVM *vm) {
+    if (!vm->read_only_filesystem) return false;
+    uint32_t denied = EPERM;
+    uc_mem_write(vm->uc, vm->errno_addr, &denied, sizeof(denied));
+    int64_t result = -1;
+    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &result);
+    return true;
+}
+
 static int linux_to_darwin_open_flags(int linux_flags) {
     int darwin_flags = 0;
     int acc_mode = linux_flags & 3;
@@ -452,6 +476,9 @@ static void hook_open(EmulatorVM *vm) {
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &flags);
     uc_reg_read(vm->uc, UC_ARM64_REG_X2, &mode);
 
+    // Linux access mode, O_CREAT, O_TRUNC, O_APPEND and O_TMPFILE.
+    if (((flags & 3) != 0 || (flags & (0x0040 | 0x0200 | 0x0400 | 0x410000)) != 0) &&
+        deny_read_only_mutation(vm)) return;
     std::string path;
     char c = 0;
     if (path_ptr) {
@@ -460,10 +487,15 @@ static void hook_open(EmulatorVM *vm) {
 
     int host_flags = linux_to_darwin_open_flags((int)flags);
     int host_fd = open(path.c_str(), host_flags, (mode_t)mode);
+    struct HostFDGuard {
+        int fd;
+        ~HostFDGuard() { if (fd >= 0) close(fd); }
+    } host_fd_guard{host_fd};
     int64_t guest_fd = -1;
     if (host_fd >= 0) {
         guest_fd = vm->next_guest_fd++;
         vm->fd_map[guest_fd] = host_fd;
+        host_fd_guard.fd = -1;
         uint32_t zero_err = 0;
         uc_mem_write(vm->uc, vm->errno_addr, &zero_err, sizeof(zero_err));
     } else {
@@ -508,6 +540,7 @@ static void hook_read(EmulatorVM *vm) {
 }
 
 static void hook_write(EmulatorVM *vm) {
+    if (deny_read_only_mutation(vm)) return;
     uint64_t guest_fd = 0, buf_ptr = 0, count = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &guest_fd);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &buf_ptr);
@@ -523,6 +556,7 @@ static void hook_write(EmulatorVM *vm) {
 }
 
 static void hook_ftruncate(EmulatorVM *vm) {
+    if (deny_read_only_mutation(vm)) return;
     uint64_t guest_fd = 0, length = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &guest_fd);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &length);
@@ -535,6 +569,7 @@ static void hook_ftruncate(EmulatorVM *vm) {
 }
 
 static void hook_mkdir(EmulatorVM *vm) {
+    if (deny_read_only_mutation(vm)) return;
     uint64_t path_ptr = 0, mode = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &path_ptr);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &mode);
@@ -560,6 +595,7 @@ static void hook_mkdir(EmulatorVM *vm) {
 }
 
 static void hook_umask(EmulatorVM *vm) {
+    if (deny_read_only_mutation(vm)) return;
     uint64_t mask = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &mask);
     int64_t old_mask = (int64_t)umask((mode_t)mask);
@@ -567,6 +603,7 @@ static void hook_umask(EmulatorVM *vm) {
 }
 
 static void hook_chmod(EmulatorVM *vm) {
+    if (deny_read_only_mutation(vm)) return;
     uint64_t path_ptr = 0, mode = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &path_ptr);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &mode);
@@ -1066,16 +1103,17 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
         return false;
     }
 
+    std::unique_ptr<FILE, int (*)(FILE *)> file_owner(f, fclose);
     fseek(f, 0, SEEK_END);
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
     std::vector<uint8_t> buffer(file_size);
     if (fread(buffer.data(), 1, file_size, f) != file_size) {
-        fclose(f);
+        file_owner.reset();
         return false;
     }
-    fclose(f);
+    file_owner.reset();
 
     if (file_size < sizeof(Elf64_Ehdr)) return false;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)buffer.data();
@@ -1240,10 +1278,17 @@ uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name) {
 
 int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us, size_t max_count) {
     if (!proc_addr) return -1;
-    g_active_vm = vm;
+    // V3_ISOLATED_ANISETTE_OTP_V1: a temporary VM must not leave a dangling fallback.
+    struct ActiveVMScope {
+        EmulatorVM *previous;
+        explicit ActiveVMScope(EmulatorVM *current) : previous(g_active_vm) { g_active_vm = current; }
+        ~ActiveVMScope() { g_active_vm = previous; }
+    } active_vm_scope(vm);
 
-    if (timeout_us == 0) timeout_us = 0;
-    if (max_count == 0) max_count = 0;
+    if (vm->read_only_filesystem) {
+        if (timeout_us == 0) timeout_us = 5000000;
+        if (max_count == 0) max_count = 50000000;
+    }
 
     static const int arm64_arg_regs[8] = {
         UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
