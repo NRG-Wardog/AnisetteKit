@@ -1,0 +1,26 @@
+name: Maintained native Anisette tests
+on:
+  push:
+    branches: [migration/runtime-source-141776ba]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record compiler versions
+        run: |
+          python3 --version
+          c++ --version
+      - name: Test maintained source directly
+        run: python3 .ci/native-tests/run_tests.py
+      - name: Require unchanged source
+        run: |
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
