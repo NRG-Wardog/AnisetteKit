@@ -1,0 +1,102 @@
+name: ADI public binary match research
+on:
+  push:
+    branches: [research/adi-binary-match-20261009]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acquire-public-binaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Locate exact public library bytes without device data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/matched
+          python3 - <<'PY'
+          import base64, hashlib, io, json, struct, urllib.request, urllib.parse, zipfile
+          from pathlib import Path
+          expected = {
+              'libstoreservicescore.so': 'bd335e6963ba5ae2f5babca613435ad56d2660a9aee37df35f876c458d105ce4',
+              'libCoreADI.so': '48aa3fca97c3655229adab617e4eb455964ed6dbb25a25ca0fc5d8dd408af62d',
+          }
+          report = {'purpose': 'public binary identity only; no device data or ADI execution', 'downloads': [], 'libraries': [], 'errors': []}
+          matched = set()
+          seen = set()
+          limit = 256 * 1024 * 1024
+          def inspect(data, label):
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  for entry in archive.infolist():
+                      name = entry.filename.rsplit('/', 1)[-1]
+                      if name not in expected or entry.file_size > 64 * 1024 * 1024:
+                          continue
+                      value = archive.read(entry)
+                      if len(value) < 64 or value[:6] != b'\x7fELF\x02\x01':
+                          continue
+                      machine = struct.unpack_from('<H', value, 18)[0]
+                      if machine != 183:
+                          continue
+                      digest = hashlib.sha256(value).hexdigest()
+                      equal = digest == expected[name]
+                      report['libraries'].append({'source': label, 'name': name, 'member': entry.filename, 'bytes': len(value), 'sha256': digest, 'exact_match': equal})
+                      if equal:
+                          Path('evidence/matched', name).write_bytes(value)
+                          matched.add(name)
+          def resolve(value, label, depth=0):
+              if depth > 4:
+                  raise ValueError('public metadata nesting limit')
+              if isinstance(value, dict):
+                  if 'oda' in value:
+                      resolve(value['oda'], label, depth + 1)
+                      return
+                  for key in ('l', 'libraries', 'payload', 'data', 'url'):
+                      item = value.get(key)
+                      if isinstance(item, str) and item:
+                          resolve(item, label, depth + 1)
+                          return
+                  raise ValueError('No ODA library entry')
+              if not isinstance(value, str):
+                  raise ValueError('Unsupported public metadata type')
+              if value.startswith('https://'):
+                  if value in seen:
+                      return
+                  seen.add(value)
+                  request = urllib.request.Request(value, headers={'User-Agent': 'SideStore-ADI-offline-source-audit'})
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      data = response.read(limit + 1)
+                  if len(data) > limit:
+                      raise ValueError('public download too large')
+                  report['downloads'].append({'source': label, 'host': urllib.parse.urlparse(value).hostname, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+              else:
+                  data = base64.b64decode(value, validate=True)
+              if data.startswith(b'PK'):
+                  inspect(data, label)
+              else:
+                  resolve(json.loads(data), label, depth + 1)
+          for label, url in (
+              ('pinned-default-oda', 'https://zzz.haus/oda.json'),
+              ('pinned-server-list', 'https://servers.sidestore.io/servers.json'),
+              ('official-apple-apk', 'https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk'),
+          ):
+              if matched == set(expected):
+                  break
+              try:
+                  resolve(url, label)
+              except Exception as error:
+                  report['errors'].append({'source': label, 'type': type(error).__name__})
+          report['matched_names'] = sorted(matched)
+          report['complete_exact_match'] = matched == set(expected)
+          Path('evidence/public-library-identity.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          if not report['complete_exact_match']:
+              raise SystemExit('Exact public library pair not found; do not substitute mismatching binaries')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matched-public-adi-libraries-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 3
