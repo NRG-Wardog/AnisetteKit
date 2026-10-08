@@ -55,10 +55,8 @@ def main():
  assert libraries,'Unicorn shared library missing'
  with tempfile.TemporaryDirectory() as temporary:
   tmp=Path(temporary)
-  # Vn in the maintained iOS fork corresponds to Qn in the upstream C API.
-  # Alias names only in this external test translation unit, never production.
-  aliases=''.join(f'#define UC_ARM64_REG_V{i} UC_ARM64_REG_Q{i}\n' for i in range(32))
-  (tmp/'main.cpp').write_text(aliases+HARNESS)
+  # Use the installed engine's real enum definitions, without macro aliases.
+  (tmp/'main.cpp').write_text(HARNESS)
   elf=bytearray(4096)
   struct.pack_into('<16sHHIQQQIHHHHHH',elf,0,b'\x7fELF\x02\x01\x01'+b'\0'*9,3,183,1,0,64,0,0,64,56,1,64,0,0)
   struct.pack_into('<IIQQQQQQ',elf,64,1,5,0,0,0,len(elf),len(elf),4096)
