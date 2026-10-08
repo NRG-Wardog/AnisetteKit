@@ -196,6 +196,16 @@ int main(int argc,char **argv) {
             assert(get_anisette_headers_uc(root.c_str(),root.c_str(),nullptr,
                 (const uint8_t*)expected_blob.data(),static_cast<uint32_t>(expected_blob.size()),&untouched)==-1);
             assert(untouched==reinterpret_cast<char *>(1));
+            // Preserve original short-circuit admission: invalid calls must not
+            // inspect otherwise unreadable root/identifier arguments for debug.
+            const char *unreadable=reinterpret_cast<const char *>(1);
+            const uint8_t *unreadable_bytes=reinterpret_cast<const uint8_t *>(1);
+            assert(get_anisette_headers_uc(nullptr,unreadable,unreadable_bytes,unreadable_bytes,1,&untouched)==-1);
+            assert(get_anisette_headers_uc(unreadable,nullptr,unreadable_bytes,unreadable_bytes,1,&untouched)==-1);
+            assert(get_anisette_headers_uc(unreadable,unreadable,unreadable_bytes,nullptr,1,&untouched)==-1);
+            assert(get_anisette_headers_uc(unreadable,unreadable,unreadable_bytes,unreadable_bytes,1,nullptr)==-1);
+            assert(untouched==reinterpret_cast<char *>(1) && activeADIConsumptionDebug==nullptr);
+
             delete normal;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
             puts("NORMAL_INVALID_ARGUMENT_PASS");return 0;
         }

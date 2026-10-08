@@ -81,6 +81,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.build = Path(cls.temporary.name)
         (cls.build / 'Loader').mkdir()
+        shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', cls.build / 'Loader/adi_consumption_debug.h')
         (cls.build / 'Loader/elf_loader_emulator.h').write_text(
             (HERE / 'fixtures/isolated_anisette_vm_double.h').read_text())
         for name in ('Native/anisette_base.h', 'Native/anisette_base.cpp',
@@ -228,7 +229,8 @@ uc_err uc_emu_start(uc_engine*,uint64_t,uint64_t,uint64_t,size_t);
 const char* uc_strerror(uc_err);
 '''
             (build / 'unicorn/unicorn.h').write_text(header)
-            (build / 'loader_functions.inc').write_text(functions)
+            shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
+            (build / 'loader_functions.inc').write_text('#include \"adi_consumption_debug.h\"\n' + functions)
             (build / 'main.cpp').write_text((HERE / 'fixtures/isolated_anisette_loader_harness.cpp').read_text())
             binary = build / 'loader-test'
             compiled = subprocess.run([compiler, '-std=c++17', '-I', str(build), str(build / 'main.cpp'),
@@ -237,6 +239,53 @@ const char* uc_strerror(uc_err);
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('ISOLATED_LOADER_CONTAINMENT_PASS', result.stdout)
+
+    def test_actual_consumer_hooks_observe_without_changing_results(self):
+        compiler = shutil.which('c++') or shutil.which('g++')
+        loader = source('Native/Loader/elf_loader_emulator.cpp')
+        signatures = ['static int linux_to_darwin_open_flags(', 'static void hook_open(',
+                      'static void hook_read(', 'static void hook_close(']
+        functions = '\n\n'.join(declaration(loader, name) for name in signatures)
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
+            (build / 'consumer_functions.inc').write_text(functions)
+            (build / 'main.cpp').write_text((HERE / 'fixtures/adi_consumption_harness.cpp').read_text())
+            for enabled in (0, 1):
+                binary = build / ('consumer-' + str(enabled))
+                compiled = subprocess.run([compiler, '-std=c++17', '-DADI_CONSUMER_DEBUG_ENABLED=' + str(enabled),
+                    '-I', str(build), str(build / 'main.cpp'), '-o', str(binary)], capture_output=True, text=True, timeout=60)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('CONSUMER_OBSERVER_PASS', result.stdout)
+
+    def test_actual_swift_consumer_decoder_rejects_private_or_malformed_values(self):
+        compiler = shutil.which('swiftc')
+        if not compiler:
+            self.skipTest('Swift compiler required for actual finite consumer decoder')
+        swift = declaration(source('Sources/AnisetteDataProvider.swift'), 'private enum TemporaryADIConsumptionTrace {')
+        harness = r'''
+let valid = "v1|0|5,0,1,1,0,0,0,-1|5,1,1,1,0,4,4,0"
+precondition(TemporaryADIConsumptionTrace.suffix(valid) == " [DEBUG_TEMPORARY_ADI_CONSUMPTION:\(valid)]")
+for value in ["SECRET-TOKEN", "v1|0|5,0,1,1,0,0,0,SECRET", "v1|0|05,0,1,1,0,0,0,-1",
+    "v1|0|6,0,1,1,0,0,0,-1", "v1|0|5,2,1,1,0,0,0,-1", "v1|0|5,0,1,1,4096,0,0,-1",
+    "v1|0|5,0,1,1,0,1048578,0,-1", "v1|0|5,0,1,1,0,0,0,33", "v1|2", "v1|0|",
+    valid + "\n", "v1|0" + String(repeating: "|5,0,1,1,0,0,0,-1", count: 33), String(repeating: "1", count: 2049)] {
+    precondition(TemporaryADIConsumptionTrace.suffix(value).isEmpty)
+}
+precondition(TemporaryADIConsumptionTrace.suffix(nil).isEmpty)
+precondition(!TemporaryADIConsumptionTrace.suffix("v1|1").isEmpty)
+print("CONSUMER_DECODER_PASS")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            main = Path(directory) / 'main.swift'; binary = Path(directory) / 'decoder'
+            main.write_text(swift + harness)
+            compiled = subprocess.run([compiler, str(main), '-o', str(binary)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('CONSUMER_DECODER_PASS', result.stdout)
 
     def test_swift_and_native_metadata_allowlists_are_identical(self):
         swift = source('Sources/AnisetteDataProvider.swift')

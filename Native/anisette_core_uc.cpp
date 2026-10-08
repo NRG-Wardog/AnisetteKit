@@ -9,6 +9,7 @@
 #include "anisette_core.h"
 #include "anisette_base.h"
 #include "Loader/elf_loader_emulator.h"
+#include "Loader/adi_consumption_debug.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -428,6 +429,7 @@ static bool setup_vm_and_adi(
         load_stage.finish(NativeOTPStage::LibraryLoadOK);
         NativeOTPStageScope library_stage(trace, NativeOTPStage::LibraryInitFailed);
         relocate_all_vm_libraries(vm);
+        adiConsumptionPhase(ADIConsumptionDebug::Constructors);
         run_library_constructors(vm);
 
         uint64_t load_lib_ptr = get_vm_symbol_address(vm, kADISymbols.load_library);
@@ -439,6 +441,7 @@ static bool setup_vm_and_adi(
         uint64_t lib_path_vm = vm->write_string(lib_path.c_str());
         LOG_UC("[AnisetteKit - UC] Step 1: Calling ADILoadLibraryWithPath (0x%llx, path=\"%s\")...\n",
                (unsigned long long)load_lib_ptr, lib_path.c_str());
+        adiConsumptionPhase(ADIConsumptionDebug::LibraryInit);
         int32_t load_res = run_vm_procedure(vm, load_lib_ptr, {lib_path_vm, 0}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
         LOG_UC("[AnisetteKit - UC] Step 1 result: %d\n", load_res);
         if (load_res != 0) {
@@ -474,6 +477,7 @@ static bool setup_vm_and_adi(
         uint64_t prov_path_vm = vm->write_string(out_uuid_prov_dir.c_str());
         LOG_UC("[AnisetteKit - UC] Step 2: Calling ADISetProvisioningPath (0x%llx, path=\"%s\")...\n",
                (unsigned long long)set_prov_ptr, out_uuid_prov_dir.c_str());
+        adiConsumptionPhase(ADIConsumptionDebug::ProvisioningPath);
         int32_t prov_res = run_vm_procedure(vm, set_prov_ptr, {prov_path_vm}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
         LOG_UC("[AnisetteKit - UC] Step 2 result: %d\n", prov_res);
         if (prov_res != 0) {
@@ -497,6 +501,7 @@ static bool setup_vm_and_adi(
         uint64_t android_id_vm = vm->write_string(android_id.c_str());
         LOG_UC("[AnisetteKit - UC] Step 3: Calling ADISetAndroidID (0x%llx, id=\"%s\", len=%zu)...\n",
                (unsigned long long)set_id_ptr, android_id.c_str(), android_id.length());
+        adiConsumptionPhase(ADIConsumptionDebug::AndroidID);
         int32_t id_res = run_vm_procedure(vm, set_id_ptr, {android_id_vm, (uint64_t)android_id.length()}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
         LOG_UC("[AnisetteKit - UC] Step 3 result: %d\n", id_res);
         if (id_res != 0) {
@@ -531,6 +536,7 @@ static int32_t get_anisette_headers_uc_locked(
     }
 
 
+    if (!isolated && activeADIConsumptionDebug) activeADIConsumptionDebug->configure(provisioning_dir, identifier);
     if (!isolated) trace.add(NativeOTPStage::ArgumentsOK);
     CheckedAnisetteStagingFailure staging_failure;
     EmulatorVM *vm = nullptr;
@@ -564,6 +570,7 @@ static int32_t get_anisette_headers_uc_locked(
     uint64_t dsid = (uint64_t)-2;
     LOG_UC("[AnisetteKit - UC] Step 4: Calling ADIOTPRequest (0x%llx)...\n", (unsigned long long)otp_req_ptr);
     NativeOTPStageScope otp_stage(&trace, NativeOTPStage::NativeOTPFailed);
+    adiConsumptionPhase(ADIConsumptionDebug::OTP);
     int32_t res = run_vm_procedure(vm, otp_req_ptr, {dsid, mid_ptr, mid_len_ptr, otp_ptr, otp_len_ptr}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
     LOG_UC("[AnisetteKit - UC] Step 4 result: %d\n", res);
 
@@ -647,10 +654,15 @@ int32_t get_anisette_headers_uc(
 ) {
     NativeOTPTrace trace(nullptr);
     std::lock_guard<std::mutex> lock(g_vm_mutex);
+    ADIConsumptionDebug consumption(nullptr, nullptr);
+    ADIConsumptionScope consumption_scope(&consumption);
     const int32_t result = get_anisette_headers_uc_locked(lib_dir, provisioning_dir, identifier,
                                          adi_pb, adi_pb_len, out_json, false, trace);
     // Invalid original arguments do not initialize the caller's output pointer.
-    if (result != ANISETTE_ERR_INVALID_ARGUMENT) trace.output = out_json;
+    if (result != ANISETTE_ERR_INVALID_ARGUMENT) {
+        trace.output = out_json;
+        if (result != ANISETTE_OK) consumption.append(out_json);
+    }
     // No UUID-directory cleanup here. Checked staging owns only its temporary;
     // the existing Swift directory-cleanup race remains outside this mutex.
     trace.add(NativeOTPStage::CleanupNotRequested);

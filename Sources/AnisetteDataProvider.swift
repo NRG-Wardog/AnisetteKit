@@ -26,8 +26,9 @@ extension AnisetteDataProvider {
         }
         var dict = try parseJSONString(String(cString: ptr))
         let temporaryTrace = dict.removeValue(forKey: "v3_native_trace")
+        let consumptionTrace = dict.removeValue(forKey: "v3_native_consumption")
         if let err = dict["error"] {
-            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
+            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace) + TemporaryADIConsumptionTrace.suffix(consumptionTrace))
         }
         return try AnisetteDataResponse(from: dict)
     }
@@ -216,5 +217,30 @@ private struct IsolatedExistingBlobProvider: AnisetteDataProvider {
     func endProvision(libDir: String, provisioningDir: String, identifier: [UInt8],
                       session: UInt32, ptm: [UInt8], tk: [UInt8]) throws -> Data {
         throw AnisetteError.invalidArgument
+    }
+}
+
+// DEBUG TEMPORARY: numeric-only consumer observations. SideStore must explicitly
+// decode this separate suffix before this diagnostic branch can be integrated.
+private enum TemporaryADIConsumptionTrace {
+    static func suffix(_ value: String?) -> String {
+        guard let value, value.utf8.count <= 2048,
+              value.utf8.allSatisfy({ $0 < 128 }) else { return "" }
+        let rows = value.split(separator: "|", omittingEmptySubsequences: false)
+        guard rows.count >= 2, rows.count <= 34, rows[0] == "v1",
+              rows[1] == "0" || rows[1] == "1" else { return "" }
+        for row in rows.dropFirst(2) {
+            let parts = row.split(separator: ",", omittingEmptySubsequences: false)
+            guard parts.count == 8 else { return "" }
+            let fields = parts.compactMap { Int($0) }
+            guard fields.count == 8,
+                  zip(parts, fields).allSatisfy({ String($0.1) == String($0.0) }),
+                  (0...5).contains(fields[0]), (0...1).contains(fields[1]),
+                  (0...4).contains(fields[2]), (-1...1).contains(fields[3]),
+                  (0...4095).contains(fields[4]),
+                  (0...1_048_577).contains(fields[5]), (0...1_048_577).contains(fields[6]),
+                  (-1...32).contains(fields[7]) else { return "" }
+        }
+        return " [DEBUG_TEMPORARY_ADI_CONSUMPTION:\(value)]"
     }
 }

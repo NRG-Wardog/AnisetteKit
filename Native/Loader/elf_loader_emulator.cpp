@@ -1,3 +1,4 @@
+#include "adi_consumption_debug.h"
 //
 //  elf_loader_emulator.cpp
 //  AnisetteKit
@@ -481,12 +482,17 @@ static void hook_open(EmulatorVM *vm) {
         deny_read_only_mutation(vm)) return;
     std::string path;
     char c = 0;
+    bool path_complete = false;
     if (path_ptr) {
-        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') path.push_back(c);
+        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK) {
+            if (c == '\0') { path_complete = true; break; }
+            path.push_back(c);
+        }
     }
 
     int host_flags = linux_to_darwin_open_flags((int)flags);
     int host_fd = open(path.c_str(), host_flags, (mode_t)mode);
+    const int observed_open_errno = host_fd < 0 ? errno : 0;
     struct HostFDGuard {
         int fd;
         ~HostFDGuard() { if (fd >= 0) close(fd); }
@@ -501,6 +507,11 @@ static void hook_open(EmulatorVM *vm) {
     } else {
         uint32_t err = (uint32_t)errno;
         uc_mem_write(vm->uc, vm->errno_addr, &err, sizeof(err));
+    }
+    if (activeADIConsumptionDebug) {
+        const int category=activeADIConsumptionDebug->target(path.c_str(),path_complete);
+        activeADIConsumptionDebug->record(ADIConsumptionDebug::Open,category,host_fd >= 0 ? 1 : -1,observed_open_errno);
+        if (host_fd >= 0) activeADIConsumptionDebug->track(static_cast<int>(guest_fd),category);
     }
     LOG_UC("[Hook] open('%s', linux=0x%x, mac=0x%x, mode=0%o) -> fd %lld (errno=%d)\n",
            path.c_str(), (int)flags, host_flags, (int)mode, (long long)guest_fd, errno);
@@ -518,6 +529,9 @@ static void hook_close(EmulatorVM *vm) {
     } else {
         res = -1;
     }
+    if (activeADIConsumptionDebug) {
+        activeADIConsumptionDebug->forget(static_cast<int>(guest_fd));
+    }
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
 }
 
@@ -527,15 +541,20 @@ static void hook_read(EmulatorVM *vm) {
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &buf_ptr);
     uc_reg_read(vm->uc, UC_ARM64_REG_X2, &count);
     int64_t res = -1;
+    int observed_read_errno = 0, observed_copy = -1;
     auto it = vm->fd_map.find((int)guest_fd);
     if (it != vm->fd_map.end()) {
         std::vector<uint8_t> tmp(count);
         ssize_t bytes_read = read(it->second, tmp.data(), count);
+        observed_read_errno = bytes_read < 0 ? errno : 0;
         if (bytes_read > 0) {
-            uc_mem_write(vm->uc, buf_ptr, tmp.data(), bytes_read);
+            observed_copy = static_cast<int>(uc_mem_write(vm->uc, buf_ptr, tmp.data(), bytes_read));
         }
         res = (int64_t)bytes_read;
     }
+    if (activeADIConsumptionDebug) activeADIConsumptionDebug->record(ADIConsumptionDebug::Read,
+        activeADIConsumptionDebug->lookup(static_cast<int>(guest_fd)),res < 0 ? -1 : (res == 0 ? 0 : 1),
+        observed_read_errno,count,res > 0 ? static_cast<uint64_t>(res) : 0,observed_copy);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
 }
 
