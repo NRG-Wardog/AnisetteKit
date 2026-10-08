@@ -1,0 +1,23 @@
+name: ADI offline research tools
+on:
+  push:
+    branches: [research/adi-binary-match-20261009]
+    paths: [.github/workflows/adi-offline-tools.yml]
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Download fixed analysis wheels only
+        run: |
+          mkdir -p wheels
+          python3 -m pip download --only-binary=:all: --no-deps --dest wheels unicorn==2.1.4 capstone==5.0.6 pyelftools==0.32
+          sha256sum wheels/*.whl > wheels/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adi-offline-tools
+          path: wheels/
+          retention-days: 3
+          if-no-files-found: error
