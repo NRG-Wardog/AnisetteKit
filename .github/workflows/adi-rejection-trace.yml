@@ -17,6 +17,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Warm the Swift Foundation compiler cache
+        run: |
+          swiftc --version
+          printf 'import Foundation\nprint("Foundation compiler ready")\n' > "$RUNNER_TEMP/swift-warmup.swift"
+          swiftc "$RUNNER_TEMP/swift-warmup.swift" -o "$RUNNER_TEMP/swift-warmup"
+          "$RUNNER_TEMP/swift-warmup"
       - name: Require unchanged ff5a1af runtime and preserved ABI fixes
         run: |
           git diff --exit-code ff5a1af34fe1fef443c1f82e614c073e21054970 -- Native Sources Package.swift Package.resolved
