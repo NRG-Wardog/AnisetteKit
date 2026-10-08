@@ -1,0 +1,185 @@
+name: ADI rejection trace development candidate
+on:
+  push:
+    branches: [debug/adi-rejection-ff5a1af]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: adi-rejection-trace-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  baseline-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require unchanged ff5a1af runtime and preserved ABI fixes
+        run: |
+          git diff --exit-code ff5a1af34fe1fef443c1f82e614c073e21054970 -- Native Sources Package.swift Package.resolved
+          python3 .ci/native-tests/run_tests.py
+          python3 .ci/native-tests/test_abi_contracts.py --sanitizers --output evidence/abi-fixed.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-baseline-evidence-${{ github.sha }}
+          path: evidence/
+          retention-days: 14
+  ios-trace:
+    needs: baseline-contracts
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NRG-Wardog/sidestore-auto-refresh
+          ref: 767234eb704745ce915c0750eee2c31061ac4f78
+          path: builder
+          persist-credentials: false
+      - name: Select the same Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '26.4'
+      - name: Acquire and verify the unchanged baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/logs artifacts/source
+          python3 builder/scripts/maintained_sources.py acquire --workspace "$GITHUB_WORKSPACE" --output artifacts/baseline-source-proof.json
+          cp builder/migration/maintained-sources.json artifacts/baseline-maintained-sources.json
+          printf '%s\n' 'MEASUREMENT ONLY on ff5a1af runtime. Not a login fix. Full unit/UI/layout/regression suites not run. Release optimization retained. Identity, Keychain, provisioning and recovery behavior unchanged. No stable release acceptance.' > artifacts/VALIDATION-SCOPE.txt
+      - name: Prepare pinned transport tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ldid >/dev/null 2>&1; then HOMEBREW_NO_AUTO_UPDATE=1 brew install ldid; fi
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios
+          if ! command -v bindgen >/dev/null 2>&1 || [ "$(bindgen --version)" != 'bindgen 0.72.1' ]; then
+            cargo install --locked --force bindgen-cli --version 0.72.1
+          fi
+      - name: Build unchanged transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd idevice
+            BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(xcrun --sdk iphoneos --show-sdk-path)" \
+              IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+              cargo build --locked --release --target aarch64-apple-ios --features obfuscate --manifest-path ffi/Cargo.toml
+            python3 -B ../builder/scripts/verify_archive_symbols.py target/aarch64-apple-ios/release/libidevice_ffi.a ../artifacts/idevice-symbols
+            cp ffi/idevice.h swift/include/idevice.h
+            xcodebuild -create-xcframework -library target/aarch64-apple-ios/release/libidevice_ffi.a -headers swift/include -output swift/IDevice.xcframework
+          ) 2>&1 | tee artifacts/logs/transport-build.log
+          mkdir -p work/EmbeddedSideStore/Dependencies/minimuxer/DeviceGateway/LocalBinary
+          cp -R idevice/swift/IDevice.xcframework work/EmbeddedSideStore/Dependencies/minimuxer/DeviceGateway/LocalBinary/IDevice.xcframework
+      - name: Resolve and prove exact baseline inputs before observation overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile -disablePackageRepositoryCache \
+            -project work/EmbeddedSideStore/AltStore.xcodeproj -scheme SideStore \
+            -derivedDataPath "$RUNNER_TEMP/embedded-sidestore-derived-data" 2>&1 | tee artifacts/logs/package-resolution.log
+          ANISETTE="$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit"
+          python3 builder/scripts/maintained_sources.py verify --workspace "$GITHUB_WORKSPACE" --anisette-source "$ANISETTE" --after-build --output artifacts/baseline-resolved-proof.json
+          python3 candidate/.ci/verify_abi_candidate.py --candidate candidate --resolved "$ANISETTE" --install --output artifacts/abi-baseline-proof.json
+          python3 candidate/.ci/adi-trace/prepare_trace.py --anisette "$ANISETTE" --host work/LiveContainer --side work/EmbeddedSideStore --receipt artifacts/trace-inputs.json
+      - name: Test generated diagnostic consumers and storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANISETTE="$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit"
+          python3 candidate/.ci/adi-trace/test_local.py --anisette "$ANISETTE" --host work/LiveContainer --side work/EmbeddedSideStore 2>&1 | tee artifacts/logs/trace-contract-tests.log
+      - name: Exercise production observer with real Unicorn and synthetic ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/trace-test-venv"
+          "$RUNNER_TEMP/trace-test-venv/bin/python" -m pip install 'unicorn==2.1.4'
+          "$RUNNER_TEMP/trace-test-venv/bin/python" candidate/.ci/adi-trace/test_unicorn.py \
+            --anisette "$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit" \
+            --output artifacts/real-unicorn-synthetic-tests.json 2>&1 | tee artifacts/logs/real-unicorn-tests.log
+      - name: Build LiveContainer with the matching diagnostic decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project work/LiveContainer/LiveContainer.xcodeproj -scheme LiveContainer -sdk iphoneos -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/livecontainer-derived-data" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee artifacts/logs/host-build.log
+      - name: Build embedded SideStore and verify unchanged diagnostic inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project work/EmbeddedSideStore/AltStore.xcodeproj -onlyUsePackageVersionsFromResolvedFile -disableAutomaticPackageResolution \
+            -scheme SideStore -sdk iphoneos -configuration Release -derivedDataPath "$RUNNER_TEMP/embedded-sidestore-derived-data" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee artifacts/logs/sidestore-build.log
+          ANISETTE="$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit"
+          python3 candidate/.ci/adi-trace/prepare_trace.py --anisette "$ANISETTE" --host work/LiveContainer --side work/EmbeddedSideStore --receipt artifacts/trace-inputs.json --verify
+          grep -Fq "$ANISETTE/Native/Loader/elf_loader_emulator.cpp" artifacts/logs/sidestore-build.log
+          grep -Fq 'AnisetteDataProvider.swift' artifacts/logs/sidestore-build.log
+          cp "$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/workspace-state.json" artifacts/workspace-state.json
+          cp work/EmbeddedSideStore/AltStore.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved artifacts/Package.resolved
+          python3 - <<'PY'
+          import json,os,shutil
+          from pathlib import Path
+          roots={'AnisetteKit':Path(os.environ['RUNNER_TEMP'])/'embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit','LiveContainer':Path('work/LiveContainer'),'SideStore':Path('work/EmbeddedSideStore')}
+          for item in json.loads(Path('artifacts/trace-inputs.json').read_text())['files']:
+              target=Path('artifacts/source')/item['owner']/item['path'];target.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(roots[item['owner']]/item['path'],target)
+          PY
+      - name: Package and verify the measurement-only IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="$RUNNER_TEMP/livecontainer-derived-data/Build/Products/Release-iphoneos/LiveContainer.app"
+          SIDE="$RUNNER_TEMP/embedded-sidestore-derived-data/Build/Products/Release-iphoneos/SideStore.app"
+          python3 builder/scripts/combined_build_evidence.py identity --product v3.1.0-adi-rejection-trace "$HOST" "$SIDE"
+          python3 builder/scripts/package_livecontainer_combined.py --root work/LiveContainer --host "$HOST" --side "$SIDE" \
+            --output artifacts/LiveContainer-SideStore-ADI-Rejection-Trace.ipa 2>&1 | tee artifacts/logs/packaging.log
+          python3 builder/scripts/patch_combined_refresh_contract.py --verify-ipa artifacts/LiveContainer-SideStore-ADI-Rejection-Trace.ipa 2>&1 | tee artifacts/logs/runtime-verification.log
+          python3 - <<'PY'
+          import hashlib,json,os,plistlib,zipfile
+          from pathlib import Path
+          ipa=Path('artifacts/LiveContainer-SideStore-ADI-Rejection-Trace.ipa')
+          with zipfile.ZipFile(ipa) as z:
+              assert z.testzip() is None
+              for name in ['Payload/LiveContainer.app/Info.plist','Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Info.plist']:
+                  p=plistlib.loads(z.read(name));assert p['LCBuilderCommit']==os.environ['GITHUB_SHA'];assert p['LCProductLine']=='Combined LC+SS v3.1.0-adi-rejection-trace'
+              for name in ['Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/SideStore','Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework/SideStoreSupport']:
+                  assert b'adi_execution=' in z.read(name)
+          proof=json.loads(Path('artifacts/trace-inputs.json').read_text())
+          proof.update(candidate_commit=os.environ['GITHUB_SHA'],ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(),ipa_bytes=ipa.stat().st_size,
+                       build_run='https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID'],full_suite_run=False)
+          Path('artifacts/candidate-provenance.json').write_text(json.dumps(proof,indent=2,sort_keys=True)+'\n')
+          print('Diagnostic IPA verified; not device-login acceptance')
+          PY
+      - name: Retain toolchain and matching symbols
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          { xcodebuild -version; xcrun clang --version; swift --version; rustc --version; cargo --version; } > artifacts/toolchain.txt 2>&1
+          python3 - <<'PY'
+          import os,tarfile
+          from pathlib import Path
+          with tarfile.open('artifacts/debug-symbols.tar.gz','w:gz') as archive:
+              for owner in ('livecontainer','embedded-sidestore'):
+                  for p in (Path(os.environ['RUNNER_TEMP'])/(owner+'-derived-data')/'Build/Products/Release-iphoneos').glob('*.dSYM'):archive.add(p,arcname=owner+'/'+p.name)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ADI-Rejection-Trace-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
