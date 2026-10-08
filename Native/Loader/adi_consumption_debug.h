@@ -15,7 +15,11 @@ struct ADIConsumptionDebug {
     enum Operation { Open, Read };
     enum Target { Other, ExpectedBlob, Relative, Unreadable, Untracked };
     struct Event { int phase, operation, target, result, error; unsigned requested, returned; int copy; };
-    struct Descriptor { int fd = -1; int target = Other; };
+    struct Descriptor {
+        int fd = -1, target = Other;
+        uint64_t offset = 0;
+        bool offsetKnown = true, copied = true;
+    };
     static constexpr unsigned limit = 32, countLimit = 1048576;
     static constexpr unsigned setupLimit = 16, otpLimit = 16;
     Event events[limit] = {};
@@ -25,9 +29,18 @@ struct ADIConsumptionDebug {
     bool truncated = false;
     Phase phase = Unknown;
     bool expectedValid = false;
-    ADIConsumptionDebug(const char *root, const uint8_t *id) noexcept { configure(root,id); }
-    void configure(const char *root, const uint8_t *id) noexcept {
+    const uint8_t *input = nullptr; // Immutable caller storage, scoped to this invocation.
+    uint32_t inputLength = 0;
+    unsigned comparison = 0, compared = 0;
+    bool inputCovered = false, coverageLost = false;
+    ADIConsumptionDebug(const char *root, const uint8_t *id,
+        const uint8_t *bytes = nullptr, uint32_t length = 0) noexcept { configure(root,id,bytes,length); }
+    void configure(const char *root, const uint8_t *id,
+        const uint8_t *bytes = nullptr, uint32_t length = 0) noexcept {
         const int saved = errno;
+        expectedValid = false;
+        input = bytes && length > 0 && length <= countLimit ? bytes : nullptr;
+        inputLength = input ? length : 0;
         if (root && id) {
             int n = snprintf(expected, sizeof(expected), "%s/%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x/adi.pb", root,
                 id[0],id[1],id[2],id[3],id[4],id[5],id[6],id[7],id[8],id[9],id[10],id[11],id[12],id[13],id[14],id[15]);
@@ -43,6 +56,7 @@ struct ADIConsumptionDebug {
     static unsigned bounded(uint64_t n) noexcept { return n > countLimit ? countLimit + 1 : static_cast<unsigned>(n); }
     void record(Operation op, int target, int result, int error, uint64_t requested=0, uint64_t returned=0, int copy=-1) noexcept {
 #if ADI_CONSUMER_DEBUG_ENABLED
+        if (target == Untracked) coverageLost = true;
         if (phase != OTP) {
             if (setupCount == setupLimit) { truncated = true; return; }
             ++setupCount;
@@ -63,12 +77,65 @@ struct ADIConsumptionDebug {
         (void)op; (void)target; (void)result; (void)error; (void)requested; (void)returned; (void)copy;
 #endif
     }
-    void track(int fd, int target) noexcept {
-        for (auto &d : descriptors) if (d.fd == -1) { d = {fd,target}; return; }
+    void track(int fd, int target, bool offsetKnown = true) noexcept {
+        if (fd < 0) { coverageLost = true; return; }
+        // Reused descriptor numbers own a new stream, never an old prefix.
+        forget(fd);
+        for (auto &d : descriptors) if (d.fd == -1) {
+            d = {fd,target,0,offsetKnown,true};
+            if (target == ExpectedBlob && !offsetKnown) coverageLost = true;
+            return;
+        }
         truncated = true;
+        coverageLost = true;
     }
     int lookup(int fd) const noexcept { for (const auto &d : descriptors) if (d.fd >= 0 && d.fd == fd) return d.target; return Untracked; }
-    void forget(int fd) noexcept { for (auto &d : descriptors) if (d.fd == fd) { d.fd = -1; return; } }
+    void forget(int fd) noexcept { for (auto &d : descriptors) if (d.fd >= 0 && d.fd == fd) { d.fd = -1; return; } }
+    void invalidateOffset(int fd) noexcept {
+        for (auto &d : descriptors) if (d.fd >= 0 && d.fd == fd) {
+            d.offsetKnown = false;
+            if (d.target == ExpectedBlob) coverageLost = true;
+            return;
+        }
+        coverageLost = true;
+    }
+    void observeRead(int fd, const uint8_t *hostBytes, uint64_t returned, int copy) noexcept {
+#if ADI_CONSUMER_DEBUG_ENABLED
+        const int saved = errno;
+        Descriptor *stream = nullptr;
+        for (auto &d : descriptors) if (d.fd >= 0 && d.fd == fd) { stream = &d; break; }
+        if (!stream) { coverageLost = true; errno = saved; return; }
+        if (stream->target != ExpectedBlob || !returned) { errno = saved; return; }
+        if (!stream->offsetKnown || returned > UINT64_MAX - stream->offset) {
+            stream->offsetKnown = false; coverageLost = true; errno = saved; return;
+        }
+        const uint64_t offset = stream->offset;
+        stream->offset += returned;
+        if (copy != 0) { stream->copied = false; coverageLost = true; }
+        if (!input || !hostBytes) { coverageLost = true; errno = saved; return; }
+        const uint64_t available = offset < inputLength ? inputLength - offset : 0;
+        const uint64_t overlap = returned < available ? returned : available;
+        const uint64_t budget = countLimit - compared;
+        const size_t examine = static_cast<size_t>(overlap < budget ? overlap : budget);
+        if (examine) {
+            if (memcmp(hostBytes, input + static_cast<size_t>(offset), examine) != 0) comparison = 2;
+            else if (comparison == 0) comparison = 1;
+            compared += static_cast<unsigned>(examine);
+        }
+        // More observed bytes than the supplied input cannot match that input.
+        // Coverage alone never establishes EOF, file length or ADI validity.
+        if (returned > available) comparison = 2;
+        if (examine < overlap) coverageLost = true;
+        if (comparison == 1 && stream->offset == inputLength && stream->copied && examine == overlap)
+            inputCovered = true;
+        errno = saved;
+#else
+        (void)fd; (void)hostBytes; (void)returned; (void)copy;
+#endif
+    }
+    unsigned coverage() const noexcept {
+        return comparison == 1 && inputCovered && !coverageLost && !truncated ? 1u : 0u;
+    }
     void append(char **output) const noexcept {
 #if ADI_CONSUMER_DEBUG_ENABLED
         const int saved = errno;
@@ -76,7 +143,7 @@ struct ADIConsumptionDebug {
         const size_t n = strlen(*output);
         if (n < 2 || (*output)[0] != '{' || (*output)[n-1] != '}') return;
         char encoded[2048] = {};
-        size_t used = static_cast<size_t>(snprintf(encoded,sizeof(encoded),"v1|%u",truncated ? 1u : 0u));
+        size_t used = static_cast<size_t>(snprintf(encoded,sizeof(encoded),"v2|%u|%u|%u",truncated ? 1u : 0u,comparison,coverage()));
         for (unsigned i=0;i<count;++i) {
             const auto &e=events[i];
             int written=snprintf(encoded+used,sizeof(encoded)-used,"|%d,%d,%d,%d,%d,%u,%u,%d",e.phase,e.operation,e.target,e.result,e.error,e.requested,e.returned,e.copy);

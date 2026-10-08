@@ -123,17 +123,17 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
                     self.assertNotIn(private, result.stdout + result.stderr)
 
     def test_normal_checked_staging_blocks_otp_and_preserves_previous_blob_on_every_io_failure(self):
-        success = ('arguments.ok,setup.begin,vm.reused,library.cached,uuid_dir.exists,'
-            'provisioning_path.ok,android_id.ok,setup.ok,root.ok,uuid_dir.exists,file.open.ok,file.stream.ok,file.write.ok,'
-            'file.flush.ok,file.close.ok,file.read_open.ok,file.readback.ok,file.read_close.ok,file.rename.ok,native.symbol.ok,'
+        success = ('arguments.ok,uuid_dir.exists,root.ok,uuid_dir.exists,file.open.ok,file.stream.ok,file.write.ok,'
+            'file.flush.ok,file.close.ok,file.read_open.ok,file.readback.ok,file.read_close.ok,file.rename.ok,'
+            'setup.begin,vm.reused,library.cached,provisioning_path.ok,android_id.ok,setup.ok,native.symbol.ok,'
             'native.otp.ok,native.output.not_checked,cleanup.not_requested').split(',')
         cases = {'ok': success,
             'otp': success[:success.index('native.otp.ok')] + ['native.otp.failed', 'cleanup.not_requested'],
             'symbol': success[:success.index('native.symbol.ok')] + ['native.symbol.failed', 'cleanup.not_requested']}
         for fault in ('mkdir', 'rootopen', 'rootlink', 'rootpermissions'):
-            cases[fault] = success[:4] + ['uuid_dir.failed', 'setup.failed', 'cleanup.not_requested']
+            cases[fault] = ['arguments.ok', 'uuid_dir.failed', 'cleanup.not_requested']
         for fault in ('uuidopen', 'uuidlink', 'uuidfile', 'uuidpermissions'):
-            cases[fault] = success[:9] + ['uuid_dir.failed', 'cleanup.not_requested']
+            cases[fault] = success[:3] + ['uuid_dir.failed', 'cleanup.not_requested']
         stages = {'open':'file.open', 'filelink':'file.open', 'hardlink':'file.open',
             'fifo':'file.open', 'temp_full':'file.open',
             'fdopen':'file.stream', 'write':'file.write', 'flush':'file.flush', 'close':'file.close',
@@ -146,8 +146,8 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             if fault in ('fdopen', 'write', 'flush'): after += ['file.close.ok']
             if stage == 'file.readback': after += ['file.read_close.ok']
             cases[fault] = success[:success.index(stage + '.ok')] + [stage + '.failed'] + after + ['cleanup.not_requested']
-        cases['cold'] = success[:2] + ['vm.init.ok', 'library.load.ok', 'library.init.ok'] + success[4:]
-        cases['fresh'] = [event if index != 4 else 'uuid_dir.created' for index, event in enumerate(success)]
+        cases['cold'] = success[:14] + ['vm.init.ok', 'library.load.ok', 'library.init.ok'] + success[16:]
+        cases['fresh'] = [event if index != 1 else 'uuid_dir.created' for index, event in enumerate(success)]
         cases['zero'] = success
         cases['large'] = success
         for fault in ('temp_exists', 'temp_link', 'crash_leftover'):
@@ -160,7 +160,19 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
                 self.assertIn('NORMAL_NATIVE_TRACE_PASS', result.stdout)
                 self.assertNotIn('file.flush.not_checked', result.stdout)
                 self.assertNotIn('file.readback.not_checked', result.stdout)
-        for fault in ('concurrent', 'retrywrite'):
+        # Every staging fault also runs from a cold VM: no native initialization
+        # may happen until the checked rename has completed.
+        for fault in ('mkdir', 'rootopen', 'rootlink', 'rootpermissions', 'uuidopen', 'uuidlink',
+                      'uuidfile', 'uuidpermissions', *stages):
+            with self.subTest(cold_fault=fault):
+                result = subprocess.run([str(self.executable), 'normal_coldfail_' + fault],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('NATIVE_TRACE=' + ','.join(cases[fault]), result.stdout)
+        for fault in ('concurrent', 'retrywrite', 'cold_new', 'same_identity', 'different_identity',
+                      'provisioned', 'invalid_libdir_missing', 'invalid_libdir_file', 'load',
+                      'setup_init', 'setup_path', 'setup_id', 'new_load', 'new_setup_init',
+                      'new_setup_path', 'new_setup_id'):
             result = subprocess.run([str(self.executable), 'normal_' + fault], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('NORMAL_NATIVE_TRACE_PASS', result.stdout)
@@ -244,13 +256,14 @@ const char* uc_strerror(uc_err);
         compiler = shutil.which('c++') or shutil.which('g++')
         loader = source('Native/Loader/elf_loader_emulator.cpp')
         signatures = ['static int linux_to_darwin_open_flags(', 'static void hook_open(',
-                      'static void hook_read(', 'static void hook_close(']
+                      'static void hook_read(', 'static void hook_close(', 'static void hook_write(']
         functions = '\n\n'.join(declaration(loader, name) for name in signatures)
         with tempfile.TemporaryDirectory() as directory:
             build = Path(directory)
             shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
             (build / 'consumer_functions.inc').write_text(functions)
             (build / 'main.cpp').write_text((HERE / 'fixtures/adi_consumption_harness.cpp').read_text())
+            syscall_receipts = []
             for enabled in (0, 1):
                 binary = build / ('consumer-' + str(enabled))
                 compiled = subprocess.run([compiler, '-std=c++17', '-DADI_CONSUMER_DEBUG_ENABLED=' + str(enabled),
@@ -259,6 +272,9 @@ const char* uc_strerror(uc_err);
                 result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('CONSUMER_OBSERVER_PASS', result.stdout)
+                syscall_receipts += [line for line in result.stdout.splitlines() if line.startswith('HOST_IO_COUNTS=')]
+            self.assertEqual(len(syscall_receipts), 2)
+            self.assertEqual(syscall_receipts[0], syscall_receipts[1], 'Passive observation must not add host I/O')
 
     def test_actual_swift_consumer_decoder_rejects_private_or_malformed_values(self):
         compiler = shutil.which('swiftc')
@@ -276,6 +292,17 @@ for value in ["SECRET-TOKEN", "v1|0|5,0,1,1,0,0,0,SECRET", "v1|0|05,0,1,1,0,0,0,
 }
 precondition(TemporaryADIConsumptionTrace.suffix(nil).isEmpty)
 precondition(!TemporaryADIConsumptionTrace.suffix("v1|1").isEmpty)
+for value in ["v2|0|0|0", "v2|0|1|0", "v2|0|1|1", "v2|1|2|0",
+              "v2|0|1|1|5,1,1,1,0,4,4,0", "v2|1|1|0" + String(repeating: "|5,0,1,1,0,0,0,-1", count: 32)] {
+    precondition(TemporaryADIConsumptionTrace.suffix(value) == " [DEBUG_TEMPORARY_ADI_CONSUMPTION:\(value)]")
+}
+for value in ["v2|0", "v2|0|1", "v2|0|01|0", "v2|0|1|01", "v2|0|3|0", "v2|0|0|1",
+              "v2|0|2|1", "v2|0|-1|0", "v2|0|1|2", "v2|0|1|0|", "v2|0|SECRET|0",
+              "v2|0|1|0\n", "v2|0|1|0|5,1,1,1,0,+4,4,0", "v2|0|1|0|5,1,1,1,0,4,4,-0",
+              "v2|0|1|0" + String(repeating: "|5,0,1,1,0,0,0,-1", count: 33),
+              "v2|0|1|0|5,1,1,1,0,99999999999999999999999999999,4,0"] {
+    precondition(TemporaryADIConsumptionTrace.suffix(value).isEmpty)
+}
 print("CONSUMER_DECODER_PASS")
 '''
         with tempfile.TemporaryDirectory() as directory:

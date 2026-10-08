@@ -164,7 +164,7 @@ struct CheckedAnisetteStagingFailure {
 #if !defined(_WIN32) && !defined(_MSC_VER)
 static int checked_anisette_make_uuid_directory(const char *root, const uint8_t *identifier,
     CheckedAnisetteStagingFailure &failure) {
-    // Keep the original mkdir position in setup, while refusing a linked root.
+    // Refuse a linked or unsafe root before creating the normal OTP UUID child.
     const std::string uuid = format_uuid_string(identifier);
     const int descriptor = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (descriptor < 0) { failure.record(errno); return -1; }
@@ -391,16 +391,16 @@ static bool setup_vm_and_adi(
     std::string &out_uuid_prov_dir,
     std::string &out_err,
     bool isolated = false, NativeOTPTrace *trace = nullptr,
-    CheckedAnisetteStagingFailure *staging_failure = nullptr
+    bool normal_otp_staged = false
 ) {
     if (trace) trace->add(NativeOTPStage::SetupBegin);
     NativeOTPStageScope setup_stage(trace, NativeOTPStage::SetupFailed);
-    if (!lib_dir) {
+    if (!normal_otp_staged && !lib_dir) {
         out_err = "Library directory path is null.";
         return false;
     }
     struct stat st;
-    if (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (!normal_otp_staged && (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode))) {
         out_err = std::string("Provided library path is not a valid directory: ") + lib_dir;
         return false;
     }
@@ -456,15 +456,13 @@ static bool setup_vm_and_adi(
 
     std::string uuid = format_uuid_string(identifier);
     out_uuid_prov_dir = std::string(provisioning_dir) + "/" + uuid;
-    const int directory_result = staging_failure
-        ? checked_anisette_make_uuid_directory(provisioning_dir, identifier, *staging_failure)
-        : mkdir(out_uuid_prov_dir.c_str(), 0755);
-    const int directory_errno = errno;
-    if (trace) trace->add(directory_result == 0 ? NativeOTPStage::DirectoryCreated :
-        (directory_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
-    if (staging_failure && directory_result != 0 && directory_errno != EEXIST) {
-        out_err = staging_failure->message();
-        return false;
+    // Normal OTP already created and checked this child before any native setup.
+    // Provisioning and isolated OTP retain their inherited setup behavior.
+    if (!normal_otp_staged) {
+        const int directory_result = mkdir(out_uuid_prov_dir.c_str(), 0755);
+        const int directory_errno = errno;
+        if (trace) trace->add(directory_result == 0 ? NativeOTPStage::DirectoryCreated :
+            (directory_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
     }
 
     if (out_uuid_prov_dir != g_current_prov_path) {
@@ -536,24 +534,44 @@ static int32_t get_anisette_headers_uc_locked(
     }
 
 
-    if (!isolated && activeADIConsumptionDebug) activeADIConsumptionDebug->configure(provisioning_dir, identifier);
+    if (!isolated && activeADIConsumptionDebug)
+        activeADIConsumptionDebug->configure(provisioning_dir, identifier, adi_pb, adi_pb_len);
     if (!isolated) trace.add(NativeOTPStage::ArgumentsOK);
     CheckedAnisetteStagingFailure staging_failure;
     EmulatorVM *vm = nullptr;
     std::string uuid_prov_dir, err;
-    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err, isolated, &trace, isolated ? nullptr : &staging_failure)) {
+    if (!isolated) {
+        // Keep invalid library paths ahead of any filesystem mutation and return
+        // the inherited loader error. The original null guard remains above.
+        struct stat st;
+        if (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            trace.add(NativeOTPStage::SetupBegin);
+            trace.add(NativeOTPStage::SetupFailed);
+            err = std::string("Provided library path is not a valid directory: ") + lib_dir;
+            *out_json = strdup(("{\"error\":\"" + err + "\"}").c_str());
+            return ANISETTE_ERR_LOADER_FAILED;
+        }
+        // Temporary ordering experiment under g_vm_mutex: stage the supplied
+        // bytes before a cold VM can run constructors or initialize ADI. Reused
+        // and freshly provisioned VMs keep their existing context and caches.
+        const int made = checked_anisette_make_uuid_directory(provisioning_dir, identifier, staging_failure);
+        const int made_errno = errno;
+        trace.add(made == 0 ? NativeOTPStage::DirectoryCreated :
+            (made_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
+        if ((made != 0 && made_errno != EEXIST) ||
+            !checked_anisette_staging(provisioning_dir, identifier, adi_pb, adi_pb_len, trace, staging_failure)) {
+            *out_json = strdup(("{\"error\":\"" + staging_failure.message() + "\"}").c_str());
+            return -6;
+        }
+    }
+    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err, isolated, &trace, !isolated)) {
         std::stringstream ss;
         ss << "{\"error\":\"" << err << "\"}";
         *out_json = strdup(ss.str().c_str());
-        return staging_failure.failed ? -6 : ANISETTE_ERR_LOADER_FAILED;
+        return ANISETTE_ERR_LOADER_FAILED;
     }
 
     std::string adi_pb_path = uuid_prov_dir + "/" + kADISymbols.adi_pb_filename;
-    if (!isolated && !checked_anisette_staging(provisioning_dir, identifier, adi_pb, adi_pb_len, trace, staging_failure)) {
-        const std::string error_json = "{\"error\":\"" + staging_failure.message() + "\"}";
-        *out_json = strdup(error_json.c_str());
-        return -6;
-    }
 
     uint64_t otp_req_ptr = get_vm_symbol_address(vm, kADISymbols.otp_request);
     trace.add(otp_req_ptr ? NativeOTPStage::NativeSymbolOK : NativeOTPStage::NativeSymbolFailed);

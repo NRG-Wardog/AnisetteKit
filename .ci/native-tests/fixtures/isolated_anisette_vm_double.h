@@ -24,12 +24,14 @@ struct PageAllocator { uint64_t next = 0x1000; uint64_t alloc(size_t len) { auto
 extern int constructed, destroyed, otp_calls, provision_calls;
 extern std::string fault, expected_blob, expected_uuid, observed_id;
 extern bool stage_observed, require_bounded;
+void observe_native_checkpoint(const char *checkpoint);
 struct EmulatorVM {
     bool read_only_filesystem = false;
     uc_engine *uc;
     PageAllocator heap;
     std::string provisioning_path;
     explicit EmulatorVM(bool checked = false) {
+        observe_native_checkpoint("vm.construct");
         if (checked && fault == "construct") throw std::runtime_error("synthetic");
         uc = new uc_engine; ++constructed;
     }

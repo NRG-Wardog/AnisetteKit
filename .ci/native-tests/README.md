@@ -7,7 +7,10 @@ metadata directly for finite allowlist and no-provisioning checks.
 
 Covered: checked normal staging faults, prior-blob preservation, saved-input
 handling, normal/isolated boundaries, concurrent requests, bounded/disabled
-trace, VM lifetime/resource cleanup and read-only isolated containment.
+trace, VM lifetime/resource cleanup and read-only isolated containment. The local
+staging-order experiment adds cold/reused/freshly-provisioned ordering coverage,
+pre-native fault checks and passive v2 input comparison/coverage fixtures; see
+[ADI_CONSUMPTION_DEBUG.md](ADI_CONSUMPTION_DEBUG.md) for limits and wire semantics.
 
 The trace-disabled case edits only a disposable compiler input, never product
 source. No historical source transform is imported or invoked. Fixtures use

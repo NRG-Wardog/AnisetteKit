@@ -550,6 +550,8 @@ static void hook_read(EmulatorVM *vm) {
         if (bytes_read > 0) {
             observed_copy = static_cast<int>(uc_mem_write(vm->uc, buf_ptr, tmp.data(), bytes_read));
         }
+        if (activeADIConsumptionDebug) activeADIConsumptionDebug->observeRead(
+            static_cast<int>(guest_fd), tmp.data(), bytes_read > 0 ? static_cast<uint64_t>(bytes_read) : 0, observed_copy);
         res = (int64_t)bytes_read;
     }
     if (activeADIConsumptionDebug) activeADIConsumptionDebug->record(ADIConsumptionDebug::Read,
@@ -571,6 +573,9 @@ static void hook_write(EmulatorVM *vm) {
         uc_mem_read(vm->uc, buf_ptr, tmp.data(), count);
         res = (int64_t)write(it->second, tmp.data(), count);
     }
+    // A successful write advances the stream outside passive read coverage.
+    if (res > 0 && activeADIConsumptionDebug)
+        activeADIConsumptionDebug->invalidateOffset(static_cast<int>(guest_fd));
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
 }
 

@@ -227,9 +227,20 @@ private enum TemporaryADIConsumptionTrace {
         guard let value, value.utf8.count <= 2048,
               value.utf8.allSatisfy({ $0 < 128 }) else { return "" }
         let rows = value.split(separator: "|", omittingEmptySubsequences: false)
-        guard rows.count >= 2, rows.count <= 34, rows[0] == "v1",
+        guard rows.count >= 2, rows.count <= 36,
               rows[1] == "0" || rows[1] == "1" else { return "" }
-        for row in rows.dropFirst(2) {
+        let headerCount: Int
+        if rows[0] == "v1" {
+            guard rows.count <= 34 else { return "" }
+            headerCount = 2
+        } else if rows[0] == "v2" {
+            guard rows.count >= 4,
+                  ["0", "1", "2"].contains(rows[2]),
+                  rows[3] == "0" || rows[3] == "1",
+                  rows[3] != "1" || rows[2] == "1" else { return "" }
+            headerCount = 4
+        } else { return "" }
+        for row in rows.dropFirst(headerCount) {
             let parts = row.split(separator: ",", omittingEmptySubsequences: false)
             guard parts.count == 8 else { return "" }
             let fields = parts.compactMap { Int($0) }

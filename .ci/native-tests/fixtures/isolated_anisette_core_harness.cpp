@@ -23,6 +23,9 @@ int constructed=0, destroyed=0, otp_calls=0, provision_calls=0;
 std::string fault, expected_blob="SYNTHETIC-EXISTING-BLOB", expected_uuid, observed_id;
 bool stage_observed=false, require_bounded=true;
 static bool normal_mode=false;
+static bool normal_otp_checks=false, synthetic_provision_success=false;
+static std::vector<std::string> native_checkpoints;
+static int library_loads=0, library_relocations=0, library_constructors=0, symbol_lookups=0;
 static bool fired=false;
 static int close_count=0;
 static std::string root;
@@ -31,6 +34,8 @@ static std::atomic<int> mixed_phase{0};
 static std::vector<uint64_t> normal_procedures;
 static std::vector<std::string> checked_created_names;
 static unsigned checked_open_attempts=0;
+static unsigned checked_mkdir_attempts=0;
+static unsigned unchecked_mkdir_attempts=0, root_open_attempts=0;
 static int normal_uuid_formats=0;
 static bool hit(const char *name) {
     if (!fired && fault==name) {
@@ -42,9 +47,18 @@ static std::string injected_format_uuid_string(const uint8_t *identifier) {
     if(normal_mode && ++normal_uuid_formats==2 && fault=="uuidalloc") throw std::bad_alloc();
     return ::format_uuid_string(identifier);
 }
-static int injected_mkdir(const char *p,mode_t m) { if(hit("mkdir"))return -1;return ::mkdir(p,m); }
-static int injected_open(const char *p,int f,mode_t m=0) { if(hit(normal_mode?"rootopen":"open"))return -1;return ::open(p,f,m); }
-static int injected_mkdirat(int fd,const char *p,mode_t m) { if(hit("mkdir"))return -1;return ::mkdirat(fd,p,m); }
+static int injected_mkdir(const char *p,mode_t m) {
+    if(normal_mode)++unchecked_mkdir_attempts;
+    if(hit("mkdir"))return -1;return ::mkdir(p,m);
+}
+static int injected_open(const char *p,int f,mode_t m=0) {
+    if(normal_mode)++root_open_attempts;
+    if(hit(normal_mode?"rootopen":"open"))return -1;return ::open(p,f,m);
+}
+static int injected_mkdirat(int fd,const char *p,mode_t m) {
+    if(normal_mode)++checked_mkdir_attempts;
+    if(hit("mkdir"))return -1;return ::mkdirat(fd,p,m);
+}
 static int injected_openat(int fd,const char *p,int f,mode_t m=0) {
     if(normal_mode && (f&O_CREAT))++checked_open_attempts;
     const char *stage=(f&O_DIRECTORY)?"uuidopen":((f&O_CREAT)?"open":"readopen");
@@ -119,29 +133,83 @@ static char *injected_strdup(const char *p) { if(hit("alloc"))return nullptr;ret
 static std::string contents(const std::string &path) {
     std::ifstream file(path,std::ios::binary);return std::string(std::istreambuf_iterator<char>(file),{});
 }
+void observe_native_checkpoint(const char *checkpoint) {
+    if(!normal_mode || !normal_otp_checks)return;
+    const std::string path=root+"/"+expected_uuid+"/adi.pb";
+    struct stat st;
+    assert(lstat(path.c_str(),&st)==0 && S_ISREG(st.st_mode));
+    assert(contents(path)==expected_blob);
+    stage_observed=true;
+    native_checkpoints.push_back(checkpoint);
+}
+
+// Snapshot the real wrapper caches and the double's native state before an
+// attempt. Every rejected staging operation must leave this whole snapshot
+// unchanged, including a cold VM and previously configured other identities.
+struct NormalState {
+    EmulatorVM *vm=g_shared_vm;
+    bool initialized=g_libraries_initialized;
+    std::string path=g_current_prov_path, id=g_current_android_id, observed=observed_id;
+    std::string native_path=vm?vm->provisioning_path:"";
+    uint64_t heap_next=vm?vm->heap.next:0;
+    std::map<uint64_t,std::vector<uint8_t>> memory=vm?vm->uc->memory:decltype(memory){};
+    int created=constructed, deleted=destroyed, otp=otp_calls, provision=provision_calls;
+    int loads=library_loads, relocations=library_relocations, constructors=library_constructors;
+    int symbols=symbol_lookups;
+    size_t procedures=normal_procedures.size(), checkpoints=native_checkpoints.size();
+    void assert_unchanged() const {
+        assert(g_shared_vm==vm && g_libraries_initialized==initialized);
+        assert(g_current_prov_path==path && g_current_android_id==id && observed_id==observed);
+        assert(constructed==created && destroyed==deleted && otp_calls==otp && provision_calls==provision);
+        assert(library_loads==loads && library_relocations==relocations && library_constructors==constructors);
+        assert(symbol_lookups==symbols && normal_procedures.size()==procedures);
+        assert(native_checkpoints.size()==checkpoints);
+        if(vm)assert(vm->provisioning_path==native_path && vm->heap.next==heap_next && vm->uc->memory==memory);
+    }
+};
 static int open_descriptor_count() {
     int count=0;for(int fd=0;fd<1024;++fd)if(fcntl(fd,F_GETFD)!=-1)++count;return count;
 }
 bool load_library_to_vm(EmulatorVM *vm,const std::string &,const std::string &) {
+    ++library_loads;observe_native_checkpoint("library.load");
     if(normal_mode) { assert(!vm->read_only_filesystem);return fault!="load"; }
     assert(vm->read_only_filesystem);
     stage_observed=contents(root+"/"+expected_uuid+"/adi.pb")==expected_blob;
     assert(stage_observed);return fault!="load";
 }
-void relocate_all_vm_libraries(EmulatorVM *) {}
-void run_library_constructors(EmulatorVM *) {}
+void relocate_all_vm_libraries(EmulatorVM *) { ++library_relocations;observe_native_checkpoint("library.relocate"); }
+void run_library_constructors(EmulatorVM *) { ++library_constructors;observe_native_checkpoint("library.constructors"); }
 uint64_t get_vm_symbol_address(EmulatorVM *,const std::string &name) {
+    ++symbol_lookups;observe_native_checkpoint("symbol.lookup");
     const std::vector<std::string> symbols={"kq56gsgHG6","nf92ngaK92","Sph98paBcz","qi864985u0","rsegvyrt87","uv5t6nhkui"};
     for(size_t i=0;i<symbols.size();++i)if(name==symbols[i])return fault=="symbol"&&i==3?0:i+1;
     return 0;
 }
 int32_t run_vm_procedure(EmulatorVM *vm,uint64_t proc,const std::vector<uint64_t>&args,uint64_t timeout,size_t count) {
+    observe_native_checkpoint("procedure.call");
     if(normal_mode)normal_procedures.push_back(proc);
     if(require_bounded) assert(timeout==5000000 && count==50000000);
     if(proc==2)vm->provisioning_path=std::string((char*)vm->uc->memory[args[0]].data());
     if(proc==3)observed_id=std::string((char*)vm->uc->memory[args[0]].data());
-    if(proc>4){++provision_calls;return -45063;}
-    if(fault=="setup"&&proc==2)return -45054;
+    if(proc>4){
+        ++provision_calls;
+        if(!synthetic_provision_success)return -45063;
+        if(proc==5) {
+            const uint8_t cpim[]={7,8,9};const uint64_t address=vm->write_bytes(cpim,sizeof(cpim));
+            const uint32_t length=sizeof(cpim),session=42;
+            uc_mem_write(vm->uc,args[3],&address,sizeof(address));
+            uc_mem_write(vm->uc,args[4],&length,sizeof(length));
+            uc_mem_write(vm->uc,args[5],&session,sizeof(session));
+        } else if(proc==6) {
+            assert(args[0]==42);
+            std::ofstream generated(vm->provisioning_path+"/adi.pb",std::ios::binary);
+            generated<<expected_blob;assert(generated.good());
+        }
+        return 0;
+    }
+    if(fault=="setup_init"&&proc==1)return -45075;
+    if((fault=="setup" || fault=="setup_path")&&proc==2)return -45054;
+    if(fault=="setup_id"&&proc==3)return -45046;
     if(proc!=4)return 0;
     ++otp_calls;
     if(normal_mode && contents(vm->provisioning_path+"/adi.pb")!=expected_blob) return -45061;
@@ -192,6 +260,8 @@ int main(int argc,char **argv) {
     if(normal_mode) {
         anisetteCoreSetLogging(0);
         if(fault=="invalid") {
+            normal_otp_checks=true;
+            const NormalState before;
             char *untouched=reinterpret_cast<char *>(1);
             assert(get_anisette_headers_uc(root.c_str(),root.c_str(),nullptr,
                 (const uint8_t*)expected_blob.data(),static_cast<uint32_t>(expected_blob.size()),&untouched)==-1);
@@ -205,17 +275,30 @@ int main(int argc,char **argv) {
             assert(get_anisette_headers_uc(unreadable,unreadable,unreadable_bytes,nullptr,1,&untouched)==-1);
             assert(get_anisette_headers_uc(unreadable,unreadable,unreadable_bytes,unreadable_bytes,1,nullptr)==-1);
             assert(untouched==reinterpret_cast<char *>(1) && activeADIConsumptionDebug==nullptr);
+            before.assert_unchanged();
+            assert(checked_mkdir_attempts==0 && unchecked_mkdir_attempts==0);
+            assert(root_open_attempts==0 && checked_open_attempts==0 && normal_uuid_formats==0);
 
             delete normal;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
             puts("NORMAL_INVALID_ARGUMENT_PASS");return 0;
         }
-        const bool cold=fault=="cold", fresh=fault=="fresh";
+        const bool cold_failure=fault.rfind("coldfail_",0)==0;
+        if(cold_failure)fault=fault.substr(9);
+        const bool new_setup_failure=fault.rfind("new_",0)==0;
+        if(new_setup_failure)fault=fault.substr(4);
+        const bool provisioned=fault=="provisioned";
+        const bool same_identity=fault=="same_identity", different_identity=fault=="different_identity";
+        const bool invalid_libdir=fault=="invalid_libdir_missing" || fault=="invalid_libdir_file";
+        const bool cold=cold_failure || fault=="cold" || fault=="cold_new" || provisioned ||
+            fault=="load" || fault=="setup_init";
+        const bool fresh=fault=="fresh" || fault=="cold_new" || new_setup_failure;
         const bool concurrent=fault=="concurrent", retry=fault=="retrywrite";
         const std::string scenario=fault;
         if(cold) {
-            delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;fault="ok";
+            delete normal;normal=nullptr;g_shared_vm=nullptr;g_libraries_initialized=false;
         }
-        if(fresh) { fault="ok";expected_blob="SYNTHETIC-FRESH-PROVISION-BLOB"; }
+        if(fault=="cold" || fault=="fresh" || fault=="cold_new" || same_identity || different_identity || provisioned)fault="ok";
+        if(fresh || provisioned)expected_blob="SYNTHETIC-FRESH-PROVISION-BLOB";
         if(fault=="zero") { fault="ok";expected_blob.clear(); }
         if(fault=="large") { fault="ok";expected_blob=std::string(1048577,'B'); }
         if(retry) fault="write";
@@ -227,11 +310,16 @@ int main(int argc,char **argv) {
         const std::string outside=root+"-outside";
         assert(::mkdir(outside.c_str(),0700)==0);
         { std::ofstream f(outside+"/adi.pb");f<<previous; }
-        if(!fresh) {
+        if(!fresh && !provisioned) {
             assert(::mkdir(directory.c_str(),0755)==0);
             std::ofstream f(destination);f<<previous;
         }
         std::string provisioning_root=root;
+        std::string library_root=root;
+        if(invalid_libdir) {
+            library_root=root+"/invalid-library-directory";
+            if(scenario=="invalid_libdir_file") { std::ofstream f(library_root);f<<"NOT-A-DIRECTORY"; }
+        }
         if(scenario=="rootlink") {
             assert(symlink(outside.c_str(),(root+"/root-link").c_str())==0);
             provisioning_root=root+"/root-link";
@@ -255,6 +343,46 @@ int main(int argc,char **argv) {
         if(scenario=="temp_link")assert(symlink((outside+"/adi.pb").c_str(),temporary_file.c_str())==0);
         if(scenario=="rootpermissions")assert(chmod(root.c_str(),0777)==0);
         if(scenario=="uuidpermissions")assert(chmod(directory.c_str(),0777)==0);
+        std::string prior_identity_directory;
+        if(same_identity || different_identity) {
+            uint8_t prior_uuid[16];memcpy(prior_uuid,uuid,sizeof(uuid));
+            if(different_identity)prior_uuid[0]=0x80;
+            EmulatorVM *configured=nullptr;std::string configured_directory,error;
+            assert(setup_vm_and_adi(configured,root.c_str(),root.c_str(),prior_uuid,
+                configured_directory,error));
+            assert(configured==normal && g_libraries_initialized && constructed==1 && destroyed==0);
+            if(different_identity) {
+                prior_identity_directory=configured_directory;
+                std::ofstream old_blob(prior_identity_directory+"/adi.pb");old_blob<<previous;
+                assert(g_current_prov_path!=directory && g_current_android_id!="0001020304050607");
+            } else assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
+        }
+        if(provisioned) {
+            synthetic_provision_success=true;
+            const uint8_t spim[]={10,11},ptm[]={12,13},tk[]={14,15};char *json=nullptr;
+            assert(start_provision_uc(root.c_str(),root.c_str(),uuid,spim,sizeof(spim),&json)==0);
+            assert(json && strstr(json,"\"session\":42") && strstr(json,"\"cpim_base64\":\"BwgJ\""));
+            free_c_string(json);json=nullptr;
+            assert(end_provision_uc(root.c_str(),root.c_str(),uuid,42,ptm,sizeof(ptm),tk,sizeof(tk),&json)==0);
+            const std::string provision_response="{\"adi_pb_base64\":\""+
+                base64_encode(reinterpret_cast<const uint8_t *>(expected_blob.data()),expected_blob.size())+"\"}";
+            assert(json && json==provision_response);free_c_string(json);
+            assert(contents(destination)==expected_blob && otp_calls==0 && provision_calls==2);
+            assert((normal_procedures==std::vector<uint64_t>{1,2,3,5,6}));
+            assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
+            assert(constructed==2 && destroyed==1 && g_libraries_initialized);
+            assert(library_loads==2 && library_constructors==1 && library_relocations==1);
+            // Match the Swift boundary: provisioning returns bytes, its UUID
+            // directory can be removed, and OTP must stage them into a new one
+            // while retaining the already initialized VM and identity caches.
+            assert(unlink(destination.c_str())==0 && rmdir(directory.c_str())==0);
+            synthetic_provision_success=false;
+        }
+        const NormalState before;
+        const std::string authoritative_blob=expected_blob;
+        const unsigned mkdir_before=checked_mkdir_attempts;
+        const unsigned unchecked_mkdir_before=unchecked_mkdir_attempts, root_open_before=root_open_attempts;
+        normal_otp_checks=true;
         if(scenario=="uuidalloc") {
             const int descriptors=open_descriptor_count();char *json=nullptr;bool threw=false;
             try {
@@ -262,18 +390,41 @@ int main(int argc,char **argv) {
                     static_cast<uint32_t>(expected_blob.size()),&json);
             } catch(const std::bad_alloc &) { threw=true; }
             assert(threw && normal_uuid_formats==2 && open_descriptor_count()==descriptors);
-            assert(otp_calls==0 && g_shared_vm==normal && contents(destination)==previous);
+            before.assert_unchanged();
+            assert(expected_blob==authoritative_blob);
+            assert(otp_calls==0 && contents(destination)==previous);
             assert(access(temporary_file.c_str(),F_OK)!=0 && !json);
             assert(unlink(destination.c_str())==0 && rmdir(directory.c_str())==0);
             assert(unlink((outside+"/adi.pb").c_str())==0 && rmdir(outside.c_str())==0);
-            delete normal;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+            delete g_shared_vm;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
             puts("NORMAL_ALLOCATION_FD_PASS");return 0;
         }
         auto invoke_normal=[&]() {
             char *json=nullptr;
-            int result=get_anisette_headers_uc(root.c_str(),provisioning_root.c_str(),uuid,
+            int result=get_anisette_headers_uc(library_root.c_str(),provisioning_root.c_str(),uuid,
                 (const uint8_t*)expected_blob.data(),static_cast<uint32_t>(expected_blob.size()),&json);
+            assert(expected_blob==authoritative_blob);
             assert(json);printf("NATIVE_TRACE=%s\n",native_trace(json).c_str());
+            if(invalid_libdir) {
+                assert(result==ANISETTE_ERR_LOADER_FAILED);
+                const std::string error="\"error\":\"Provided library path is not a valid directory: "+library_root+"\"";
+                assert(strstr(json,error.c_str()));
+            }
+            const std::map<std::string,std::string> setup_errors={
+                {"load","Failed to load libraries into VM"},
+                {"setup_init","ADILoadLibraryWithPath failed: -45075"},
+                {"setup_path","ADISetProvisioningPath failed: -45054"},
+                {"setup_id","ADISetAndroidID failed: -45046"}};
+            if(setup_errors.count(fault)) {
+                assert(result==ANISETTE_ERR_LOADER_FAILED);
+                const std::string error="\"error\":\""+setup_errors.at(fault)+"\"";
+                assert(strstr(json,error.c_str()));
+            }
+            if(fault=="otp") {
+                assert(result==-45061);
+                assert(strstr(json,"ADIOTPRequest failed (") && strstr(json,"): -45061\""));
+            }
+            if(fault=="symbol")assert(result==ANISETTE_ERR_SYMBOL_MISSING && strstr(json,"Symbol ADIOTPRequest missing"));
             if(result==-6) {
                 assert(strstr(json,"Checked OTP staging failed"));
                 int expected_errno=0;
@@ -299,14 +450,23 @@ int main(int argc,char **argv) {
             a.join();b.join();assert(result==0 && second==0 && otp_calls==2);
         } else result=invoke_normal();
         const bool foreign_temporary=scenario=="temp_exists" || scenario=="temp_link" || scenario=="crash_leftover";
-        const bool promoted=fault=="ok" || fault=="otp" || fault=="symbol" || concurrent || foreign_temporary;
-        if(promoted) {
+        const bool setup_failure=fault=="load" || fault=="setup_init" || fault=="setup_path" || fault=="setup_id";
+        const bool promoted=fault=="ok" || fault=="otp" || fault=="symbol" || concurrent || foreign_temporary || setup_failure;
+        if(invalid_libdir) {
+            before.assert_unchanged();
+            assert(checked_mkdir_attempts==mkdir_before && checked_open_attempts==0);
+            assert(root_open_attempts==root_open_before && normal_uuid_formats==0);
+            assert(contents(destination)==previous);
+        } else if(promoted) {
             if(fault=="ok" || concurrent || foreign_temporary) assert(result==0);
             else assert(result!=0);
             assert(contents(destination)==expected_blob);
-            if(!concurrent)assert(otp_calls==(fault=="symbol"?0:1));
+            if(!concurrent)assert(otp_calls-before.otp==((fault=="symbol" || setup_failure)?0:1));
+            assert(stage_observed && native_checkpoints.size()>before.checkpoints);
         } else {
             assert(result==-6 && otp_calls==0);
+            before.assert_unchanged();
+            assert(!stage_observed);
             if(scenario!="uuidfile" && scenario!="fifo" && scenario!="rootreplace")assert(contents(destination)==previous);
             if(scenario=="rootreplace") {
                 assert(contents(destination)=="FOREIGN-REPLACEMENT-BLOB");
@@ -317,6 +477,9 @@ int main(int argc,char **argv) {
             if(scenario=="uuidfile")assert(contents(directory)==previous);
             assert(std::find(normal_procedures.begin(),normal_procedures.end(),4)==normal_procedures.end());
         }
+        const bool root_rejected=scenario=="rootopen" || scenario=="rootlink" || scenario=="rootpermissions";
+        if(!invalid_libdir)assert(checked_mkdir_attempts-mkdir_before==(root_rejected?0u:(concurrent?2u:1u)));
+        assert(unchecked_mkdir_attempts==unchecked_mkdir_before);
         if(scenario=="temp_exists" || scenario=="crash_leftover" || scenario=="temp_full")assert(contents(temporary_file)==foreign);
         else if(scenario=="temp_link") { struct stat st;assert(lstat(temporary_file.c_str(),&st)==0 && S_ISLNK(st.st_mode)); }
         else assert(access(temporary_file.c_str(),F_OK)!=0);
@@ -332,17 +495,42 @@ int main(int argc,char **argv) {
         }
         assert(contents(outside+"/adi.pb")==previous);
         assert(access((outside+"/"+expected_uuid).c_str(),F_OK)!=0);
-        assert(provision_calls==0 && g_libraries_initialized && !g_shared_vm->read_only_filesystem);
-        if(!cold)assert(g_shared_vm==normal && constructed==1 && destroyed==0);
-        else assert(constructed==2 && destroyed==1);
-        if(scenario=="mkdir" || scenario=="rootopen" || scenario=="rootlink" || scenario=="rootpermissions") {
-            assert(g_current_prov_path=="unchanged-normal-path" && g_current_android_id=="UNCHANGEDNORMAL");
-            assert(normal_procedures.empty());
-        } else {
-            assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
-            const size_t first=cold?1:0;
-            if(cold)assert(normal_procedures[0]==1);
-            assert(normal_procedures[first]==2 && normal_procedures[first+1]==3);
+        assert(provision_calls==before.provision);
+        if(promoted) {
+            assert(g_shared_vm && !g_shared_vm->read_only_filesystem);
+            assert(destroyed==before.deleted);
+            if(before.vm) {
+                assert(g_shared_vm==before.vm && constructed==before.created);
+                assert(library_loads==before.loads && library_relocations==before.relocations);
+                assert(library_constructors==before.constructors);
+            } else {
+                assert(constructed==before.created+1);
+                assert(std::count(native_checkpoints.begin(),native_checkpoints.end(),"vm.construct")==1);
+                assert(library_loads==before.loads+(fault=="load"?1:2));
+                assert(library_relocations==before.relocations+(fault=="load"?0:1));
+                assert(library_constructors==before.constructors+(fault=="load"?0:1));
+            }
+            assert(g_libraries_initialized==(fault!="load" && fault!="setup_init"));
+            std::vector<uint64_t> expected_procedures;
+            if(fault!="load") {
+                if(!before.initialized)expected_procedures.push_back(1);
+                if(fault!="setup_init") {
+                    if(before.path!=directory)expected_procedures.push_back(2);
+                    if(fault!="setup_path") {
+                        if(before.id!="0001020304050607")expected_procedures.push_back(3);
+                        if(fault!="setup_id" && fault!="symbol") {
+                            expected_procedures.push_back(4);
+                            if(concurrent)expected_procedures.push_back(4);
+                        }
+                    }
+                }
+            }
+            const std::vector<uint64_t> actual_procedures(normal_procedures.begin()+before.procedures,normal_procedures.end());
+            assert(actual_procedures==expected_procedures);
+            const bool path_succeeded=fault!="load" && fault!="setup_init" && fault!="setup_path";
+            const bool id_succeeded=path_succeeded && fault!="setup_id";
+            assert(g_current_prov_path==(path_succeeded?directory:before.path));
+            assert(g_current_android_id==(id_succeeded?"0001020304050607":before.id));
         }
         if(retry) {
             fault="ok";fired=false;close_count=0;
@@ -350,6 +538,12 @@ int main(int argc,char **argv) {
             assert(g_shared_vm==normal && constructed==1 && destroyed==0);
             assert(access(temporary_file.c_str(),F_OK)!=0);
         }
+        if(different_identity) {
+            assert(contents(prior_identity_directory+"/adi.pb")==previous);
+            assert(unlink((prior_identity_directory+"/adi.pb").c_str())==0);
+            assert(rmdir(prior_identity_directory.c_str())==0);
+        }
+        if(scenario=="invalid_libdir_file")assert(unlink(library_root.c_str())==0);
         if(scenario=="uuidlink" || scenario=="uuidfile")assert(unlink(directory.c_str())==0);
         else {
             unlink(temporary_file.c_str());unlink(historical_temporary.c_str());
