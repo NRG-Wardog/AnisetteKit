@@ -902,6 +902,28 @@ static void hook_strtoll(EmulatorVM *vm) {
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &val);
 }
 
+static void hook_strtoull(EmulatorVM *vm) {
+    uint64_t nptr = 0, endptr = 0, base = 0;
+    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
+    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &endptr);
+    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &base);
+
+    std::string str;
+    char c = 0;
+    if (nptr) {
+        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+    }
+
+    char *host_end = nullptr;
+    uint64_t val = strtoull(str.c_str(), &host_end, (int)base);
+    if (endptr != 0 && host_end != nullptr) {
+        size_t consumed = host_end - str.c_str();
+        uint64_t final_end_addr = (nptr - str.length() - 1) + consumed;
+        uc_mem_write(vm->uc, endptr, &final_end_addr, sizeof(final_end_addr));
+    }
+    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &val);
+}
+
 static void hook_strtod(EmulatorVM *vm) {
     uint64_t nptr = 0, endptr = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
@@ -920,6 +942,21 @@ static void hook_strtod(EmulatorVM *vm) {
         uint64_t final_end_addr = (nptr - str.length() - 1) + consumed;
         uc_mem_write(vm->uc, endptr, &final_end_addr, sizeof(final_end_addr));
     }
+    uint8_t d0_val[16] = {0};
+    memcpy(d0_val, &val, sizeof(double));
+    uc_reg_write(vm->uc, UC_ARM64_REG_Q0, d0_val);
+}
+
+// atof has one argument. X1 is not an end-pointer supplied by its caller.
+static void hook_atof(EmulatorVM *vm) {
+    uint64_t nptr = 0;
+    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
+    std::string str;
+    char c = 0;
+    if (nptr) {
+        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+    }
+    double val = strtod(str.c_str(), nullptr);
     uint8_t d0_val[16] = {0};
     memcpy(d0_val, &val, sizeof(double));
     uc_reg_write(vm->uc, UC_ARM64_REG_Q0, d0_val);
@@ -990,14 +1027,18 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
     else if (name == "__cxa_guard_release") hook_cxa_guard_release(vm);
     else if (name == "__cxa_allocate_exception") hook_cxa_allocate_exception(vm);
     else if (name == "__cxa_begin_catch" || name == "__dynamic_cast") hook_dynamic_cast(vm);
-    else if (name == "strtoll" || name == "strtol" || name == "strtoull") hook_strtoll(vm);
-    else if (name == "strtod" || name == "atof") hook_strtod(vm);
+    else if (name == "strtoll" || name == "strtol") hook_strtoll(vm);
+    else if (name == "strtoull") hook_strtoull(vm);
+    else if (name == "strtod") hook_strtod(vm);
+    else if (name == "atof") hook_atof(vm);
     else if (name == "pthread_rwlock_init" || name == "pthread_mutex_init") {
         uint64_t lock_ptr = 0;
         uc_reg_read(vm->uc, UC_ARM64_REG_X0, &lock_ptr);
         if (lock_ptr) {
-            std::vector<uint8_t> dummy_lock(64, 0);
-            uc_mem_write(vm->uc, lock_ptr, dummy_lock.data(), 64);
+            // AArch64 Bionic ABI sizes, never the host pthread types.
+            const size_t guest_size = name == "pthread_mutex_init" ? 40u : 56u;
+            std::vector<uint8_t> dummy_lock(guest_size, 0);
+            uc_mem_write(vm->uc, lock_ptr, dummy_lock.data(), dummy_lock.size());
         }
         uint64_t ret = 0;
         uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
