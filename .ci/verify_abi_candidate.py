@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 
 BASE = 'f494494ede88890555df345054f7fbb87b53aea5'
@@ -51,6 +52,19 @@ def bytes_at(root: Path, name: str, mode: str) -> bytes:
     return path.read_bytes()
 
 
+def install_source(path: Path, content: bytes) -> None:
+    # SwiftPM makes noneditable source checkouts read-only. This isolated
+    # development lane changes only the hash-verified file, never the whole
+    # checkout. Restore its original permissions even when writing fails.
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        if not original_mode & stat.S_IWUSR:
+            path.chmod(original_mode | stat.S_IWUSR)
+        path.write_bytes(content)
+    finally:
+        path.chmod(original_mode)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', type=Path, required=True)
@@ -76,7 +90,7 @@ def main() -> None:
     require(not any(p.startswith((b'Native/', b'Sources/')) for p in untracked),
             'Untracked compiler inputs in SPM checkout')
     if args.install:
-        (resolved / CHANGED).write_bytes(fixed)
+        install_source(resolved / CHANGED, fixed)
     hashes = {}
     for name, (mode, sha) in inventory.items():
         data = bytes_at(resolved, name, mode)
