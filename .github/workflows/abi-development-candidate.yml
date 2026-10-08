@@ -1,0 +1,212 @@
+name: ADI ABI development candidate
+
+on:
+  push:
+    branches: [fix/adi-abi-20261008]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adi-abi-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test unchanged native staging and containment contracts
+        run: python3 .ci/native-tests/run_tests.py
+      - name: Test fixed production ABI hooks
+        run: python3 .ci/native-tests/test_abi_contracts.py --sanitizers --output evidence/abi-fixed.json
+      - name: Prove the same assertions reject the original implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show f494494ede88890555df345054f7fbb87b53aea5:Native/Loader/elf_loader_emulator.cpp > "$RUNNER_TEMP/original-loader.cpp"
+          set +e
+          python3 .ci/native-tests/test_abi_contracts.py --sanitizers --source "$RUNNER_TEMP/original-loader.cpp" --output evidence/abi-original.json
+          status=$?
+          set -e
+          test "$status" -eq 1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          old = json.loads(Path('evidence/abi-original.json').read_text())
+          new = json.loads(Path('evidence/abi-fixed.json').read_text())
+          assert old['source_git_blob'] == '83ca3d4f273cd1e7acab2dda2d687801335eb3f1'
+          assert new['source_git_blob'] == '6f8f156afe9ca4a49272f0f9b5d242a7cbdc56ad'
+          assert 'CHECKS=42 FAILURES=10' in old['stdout']
+          assert 'CHECKS=42 FAILURES=0' in new['stdout']
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: abi-native-evidence-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  ios-candidate:
+    needs: native-abi
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NRG-Wardog/sidestore-auto-refresh
+          ref: 767234eb704745ce915c0750eee2c31061ac4f78
+          path: builder
+          persist-credentials: false
+      - name: Select baseline Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '26.4'
+      - name: Acquire and verify the unchanged integration baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/logs artifacts/source
+          test "$(git -C builder rev-parse HEAD)" = 767234eb704745ce915c0750eee2c31061ac4f78
+          python3 builder/scripts/maintained_sources.py acquire --workspace "$GITHUB_WORKSPACE" --output artifacts/baseline-source-proof.json
+          cp builder/migration/maintained-sources.json artifacts/baseline-maintained-sources.json
+          printf '%s\n' 'DEVELOPMENT ABI CANDIDATE. Full unit/UI/layout/regression suites intentionally not run. Device login is not verified. Stable release gates remain unchanged.' > artifacts/VALIDATION-SCOPE.txt
+      - name: Build the unchanged LiveContainer host
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project work/LiveContainer/LiveContainer.xcodeproj \
+            -scheme LiveContainer -sdk iphoneos -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/livecontainer-derived-data" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee artifacts/logs/host-build.log
+      - name: Prepare baseline transport build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ldid >/dev/null 2>&1; then HOMEBREW_NO_AUTO_UPDATE=1 brew install ldid; fi
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios
+          if ! command -v bindgen >/dev/null 2>&1 || [ "$(bindgen --version)" != 'bindgen 0.72.1' ]; then
+            cargo install --locked --force bindgen-cli --version 0.72.1
+          fi
+      - name: Build unchanged idevice transport and stage its framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd idevice
+            BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(xcrun --sdk iphoneos --show-sdk-path)" \
+              IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+              cargo build --locked --release --target aarch64-apple-ios --features obfuscate --manifest-path ffi/Cargo.toml
+            test -f target/aarch64-apple-ios/release/libidevice_ffi.a
+            test -f ffi/idevice.h
+            grep -Fq tunnel_create_usb ffi/idevice.h
+            grep -Fq tunnel_heartbeat_is_active ffi/idevice.h
+            grep -Fq idevice_set_transport_log_callback ffi/idevice.h
+            python3 -B ../builder/scripts/verify_archive_symbols.py \
+              target/aarch64-apple-ios/release/libidevice_ffi.a ../artifacts/idevice-symbols
+            cp ffi/idevice.h swift/include/idevice.h
+            xcodebuild -create-xcframework -library target/aarch64-apple-ios/release/libidevice_ffi.a \
+              -headers swift/include -output swift/IDevice.xcframework
+          ) 2>&1 | tee artifacts/logs/transport-build.log
+          MUX=work/EmbeddedSideStore/Dependencies/minimuxer
+          mkdir -p "$MUX/DeviceGateway/LocalBinary"
+          cp -R idevice/swift/IDevice.xcframework "$MUX/DeviceGateway/LocalBinary/IDevice.xcframework"
+      - name: Resolve exact baseline packages then install the explicit source overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies -onlyUsePackageVersionsFromResolvedFile -disablePackageRepositoryCache \
+            -project work/EmbeddedSideStore/AltStore.xcodeproj -scheme SideStore \
+            -derivedDataPath "$RUNNER_TEMP/embedded-sidestore-derived-data" 2>&1 | tee artifacts/logs/package-resolution.log
+          ANISETTE="$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit"
+          python3 builder/scripts/maintained_sources.py verify --workspace "$GITHUB_WORKSPACE" \
+            --anisette-source "$ANISETTE" --after-build --output artifacts/baseline-resolved-source-proof.json
+          python3 candidate/.ci/verify_abi_candidate.py --candidate candidate --resolved "$ANISETTE" \
+            --install --output artifacts/compiler-input-before.json
+          python3 candidate/.ci/native-tests/test_abi_contracts.py --source "$ANISETTE/Native/Loader/elf_loader_emulator.cpp" \
+            --sanitizers --output artifacts/abi-resolved-macos.json
+          cp "$ANISETTE/Native/Loader/elf_loader_emulator.cpp" artifacts/source/
+      - name: Compile embedded SideStore with the verified fixed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project work/EmbeddedSideStore/AltStore.xcodeproj \
+            -onlyUsePackageVersionsFromResolvedFile -disableAutomaticPackageResolution \
+            -scheme SideStore -sdk iphoneos -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/embedded-sidestore-derived-data" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee artifacts/logs/sidestore-build.log
+          ANISETTE="$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/checkouts/AnisetteKit"
+          python3 candidate/.ci/verify_abi_candidate.py --candidate candidate --resolved "$ANISETTE" \
+            --output artifacts/compiler-input-after.json
+          cmp artifacts/compiler-input-before.json artifacts/compiler-input-after.json
+          grep -Fq "$ANISETTE/Native/Loader/elf_loader_emulator.cpp" artifacts/logs/sidestore-build.log
+          cp "$RUNNER_TEMP/embedded-sidestore-derived-data/SourcePackages/workspace-state.json" artifacts/workspace-state.json
+          cp work/EmbeddedSideStore/AltStore.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved artifacts/Package.resolved
+      - name: Package and verify the development IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="$RUNNER_TEMP/livecontainer-derived-data/Build/Products/Release-iphoneos/LiveContainer.app"
+          SIDE="$RUNNER_TEMP/embedded-sidestore-derived-data/Build/Products/Release-iphoneos/SideStore.app"
+          python3 builder/scripts/combined_build_evidence.py identity --product v3.1.0-adi-abi-debug "$HOST" "$SIDE"
+          python3 builder/scripts/package_livecontainer_combined.py \
+            --root work/LiveContainer --host "$HOST" --side "$SIDE" \
+            --output artifacts/LiveContainer-SideStore-ADI-ABI-debug.ipa 2>&1 | tee artifacts/logs/packaging.log
+          python3 builder/scripts/patch_combined_refresh_contract.py \
+            --verify-ipa artifacts/LiveContainer-SideStore-ADI-ABI-debug.ipa 2>&1 | tee artifacts/logs/runtime-package-verification.log
+          python3 - <<'PY'
+          import hashlib, json, os, plistlib, zipfile
+          from pathlib import Path
+          ipa = Path('artifacts/LiveContainer-SideStore-ADI-ABI-debug.ipa')
+          with zipfile.ZipFile(ipa) as archive:
+              assert archive.testzip() is None
+              for name in ['Payload/LiveContainer.app/Info.plist',
+                           'Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Info.plist']:
+                  info = plistlib.loads(archive.read(name))
+                  assert info['LCBuilderCommit'] == os.environ['GITHUB_SHA']
+                  assert info['LCProductLine'] == 'Combined LC+SS v3.1.0-adi-abi-debug'
+          proof = json.loads(Path('artifacts/compiler-input-after.json').read_text())
+          proof.update(ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(), ipa_bytes=ipa.stat().st_size,
+                       build_run='https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+                       xcode_configuration='Release', artifact_purpose='development-only ABI correction candidate')
+          Path('artifacts/candidate-provenance.json').write_text(json.dumps(proof, indent=2, sort_keys=True) + '\n')
+          print('Development IPA package verification: PASS; device login remains unverified')
+          PY
+      - name: Preserve toolchain and matching debug symbols
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          { xcodebuild -version; xcrun clang --version; swift --version; rustc --version; cargo --version; } > artifacts/toolchain.txt 2>&1
+          python3 - <<'PY'
+          import os, tarfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          with tarfile.open('artifacts/debug-symbols.tar.gz', 'w:gz') as output:
+              for kind in ('livecontainer', 'embedded-sidestore'):
+                  products = root / (kind + '-derived-data') / 'Build/Products/Release-iphoneos'
+                  for item in products.glob('*.dSYM'):
+                      output.add(item, arcname=kind + '/' + item.name)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LC-SS-ADI-ABI-development-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
