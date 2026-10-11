@@ -8,6 +8,7 @@
 //
 
 #include "elf_loader_emulator.h"
+#include "android_tls_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -196,6 +197,29 @@ EmulatorVM::EmulatorVM(bool checked)
 
     check(uc_hook_add(uc, &invalid_hook, UC_HOOK_MEM_UNMAPPED, (void *)hook_mem_invalid, this, 1, 0));
 
+    // Each engine owns one Bionic TLS stack guard. Never reuse device identity
+    // data as entropy, and never initialize this per procedure/constructor.
+    try {
+        static_assert(android_tls_runtime::page >= kStackAddress + kStackSize, "TLS overlaps stack");
+        static_assert(android_tls_runtime::page + android_tls_runtime::page_size <= kImportAddress, "TLS overlaps imports");
+        // Library allocator ends at0x40000000; heap ends at0x68000000.
+        const uint64_t guard = android_tls_runtime::make_guard([]() -> uint64_t {
+            uint64_t value = 0;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+            arc4random_buf(&value, sizeof(value));
+#else
+            std::random_device entropy;
+            value = std::uniform_int_distribution<uint64_t>()(entropy);
+#endif
+            return value;
+        });
+        if (!android_tls_runtime::initialize(uc, guard))
+            throw std::runtime_error("Android TLS initialization failed");
+    } catch (...) {
+        uc_close(uc); uc = nullptr;
+        throw;
+    }
+
     uc_hook intr_hook = 0;
     check(uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void *)hook_intr, this, 1, 0));
 
@@ -253,6 +277,10 @@ static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data) {
     uint64_t pc = 0;
     uc_reg_read(uc, UC_ARM64_REG_PC, &pc);
     LOG_UC("[Emulator] Interrupt %u at PC=0x%llx\n", intno, (unsigned long long)pc);
+    // No interrupt is implemented by this callback. Stop instead of repeatedly
+    // executing the faulting instruction or reporting a false normal return.
+    if (auto *vm = static_cast<EmulatorVM *>(user_data)) vm->unsupported_interrupt = true;
+    uc_emu_stop(uc);
 }
 
 static void hook_malloc(EmulatorVM *vm) {
@@ -902,6 +930,28 @@ static void hook_strtoll(EmulatorVM *vm) {
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &val);
 }
 
+static void hook_strtoull(EmulatorVM *vm) {
+    uint64_t nptr = 0, endptr = 0, base = 0;
+    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
+    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &endptr);
+    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &base);
+
+    std::string str;
+    char c = 0;
+    if (nptr) {
+        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+    }
+
+    char *host_end = nullptr;
+    uint64_t val = strtoull(str.c_str(), &host_end, (int)base);
+    if (endptr != 0 && host_end != nullptr) {
+        size_t consumed = host_end - str.c_str();
+        uint64_t final_end_addr = (nptr - str.length() - 1) + consumed;
+        uc_mem_write(vm->uc, endptr, &final_end_addr, sizeof(final_end_addr));
+    }
+    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &val);
+}
+
 static void hook_strtod(EmulatorVM *vm) {
     uint64_t nptr = 0, endptr = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
@@ -920,6 +970,21 @@ static void hook_strtod(EmulatorVM *vm) {
         uint64_t final_end_addr = (nptr - str.length() - 1) + consumed;
         uc_mem_write(vm->uc, endptr, &final_end_addr, sizeof(final_end_addr));
     }
+    uint8_t d0_val[16] = {0};
+    memcpy(d0_val, &val, sizeof(double));
+    uc_reg_write(vm->uc, UC_ARM64_REG_Q0, d0_val);
+}
+
+// atof has one argument. X1 is not an end-pointer supplied by its caller.
+static void hook_atof(EmulatorVM *vm) {
+    uint64_t nptr = 0;
+    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &nptr);
+    std::string str;
+    char c = 0;
+    if (nptr) {
+        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+    }
+    double val = strtod(str.c_str(), nullptr);
     uint8_t d0_val[16] = {0};
     memcpy(d0_val, &val, sizeof(double));
     uc_reg_write(vm->uc, UC_ARM64_REG_Q0, d0_val);
@@ -990,14 +1055,18 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
     else if (name == "__cxa_guard_release") hook_cxa_guard_release(vm);
     else if (name == "__cxa_allocate_exception") hook_cxa_allocate_exception(vm);
     else if (name == "__cxa_begin_catch" || name == "__dynamic_cast") hook_dynamic_cast(vm);
-    else if (name == "strtoll" || name == "strtol" || name == "strtoull") hook_strtoll(vm);
-    else if (name == "strtod" || name == "atof") hook_strtod(vm);
+    else if (name == "strtoll" || name == "strtol") hook_strtoll(vm);
+    else if (name == "strtoull") hook_strtoull(vm);
+    else if (name == "strtod") hook_strtod(vm);
+    else if (name == "atof") hook_atof(vm);
     else if (name == "pthread_rwlock_init" || name == "pthread_mutex_init") {
         uint64_t lock_ptr = 0;
         uc_reg_read(vm->uc, UC_ARM64_REG_X0, &lock_ptr);
         if (lock_ptr) {
-            std::vector<uint8_t> dummy_lock(64, 0);
-            uc_mem_write(vm->uc, lock_ptr, dummy_lock.data(), 64);
+            // AArch64 Bionic ABI sizes, never the host pthread types.
+            const size_t guest_size = name == "pthread_mutex_init" ? 40u : 56u;
+            std::vector<uint8_t> dummy_lock(guest_size, 0);
+            uc_mem_write(vm->uc, lock_ptr, dummy_lock.data(), dummy_lock.size());
         }
         uint64_t ret = 0;
         uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
@@ -1271,25 +1340,34 @@ void relocate_all_vm_libraries(EmulatorVM *vm) {
     }
 }
 
-void run_library_constructors(EmulatorVM *vm) {
+bool run_library_constructors(EmulatorVM *vm) {
+    if (!vm || vm->initialization_failed) return false;
     for (const auto &lib : vm->loaded_libraries) {
         if (lib.init_func) {
             LOG_UC("[Emulator] Calling DT_INIT at 0x%llx for '%s'...\n",
                    (unsigned long long)lib.init_func, lib.name.c_str());
-            run_vm_procedure(vm, lib.init_func, {});
+            bool completed = false;
+            run_vm_procedure(vm, lib.init_func, {}, 0, 0, &completed);
+            if (!completed) { vm->initialization_failed = true; return false; }
         }
         if (lib.init_array && lib.init_arraysz) {
             size_t count = lib.init_arraysz / 8;
             for (size_t i = 0; i < count; i++) {
                 uint64_t ctor_ptr = 0;
-                if (uc_mem_read(vm->uc, lib.init_array + i * 8, &ctor_ptr, 8) == UC_ERR_OK && ctor_ptr != 0) {
+                if (uc_mem_read(vm->uc, lib.init_array + i * 8, &ctor_ptr, 8) != UC_ERR_OK) {
+                    vm->initialization_failed = true; return false;
+                }
+                if (ctor_ptr != 0) {
                     LOG_UC("[Emulator] Calling DT_INIT_ARRAY[%zu] at 0x%llx for '%s'...\n",
                            i, (unsigned long long)ctor_ptr, lib.name.c_str());
-                    run_vm_procedure(vm, ctor_ptr, {});
+                    bool completed = false;
+                    run_vm_procedure(vm, ctor_ptr, {}, 0, 0, &completed);
+                    if (!completed) { vm->initialization_failed = true; return false; }
                 }
             }
         }
     }
+    return true;
 }
 
 uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name) {
@@ -1300,8 +1378,9 @@ uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name) {
     return 0;
 }
 
-int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us, size_t max_count) {
-    if (!proc_addr) return -1;
+int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us, size_t max_count, bool *execution_completed) {
+    if (execution_completed) *execution_completed = false;
+    if (!vm || vm->initialization_failed || !proc_addr) return -1;
     // V3_ISOLATED_ANISETTE_OTP_V1: a temporary VM must not leave a dangling fallback.
     struct ActiveVMScope {
         EmulatorVM *previous;
@@ -1351,16 +1430,22 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
     LOG_UC("[Emulator] Starting emu at 0x%llx (insn=0x%08x), SP=0x%llx, LR=0x%llx...\n",
            (unsigned long long)proc_addr, first_insn, (unsigned long long)stack_top, (unsigned long long)kReturnAddress);
 
+    vm->unsupported_interrupt = false;
     uc_err err = uc_emu_start(vm->uc, proc_addr, kReturnAddress, timeout_us, max_count);
+    if (err == UC_ERR_OK && vm->unsupported_interrupt) err = UC_ERR_EXCEPTION;
 
     uint64_t pc = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_PC, &pc);
+    const uc_err pc_status = uc_reg_read(vm->uc, UC_ARM64_REG_PC, &pc);
+    if (err == UC_ERR_OK && pc_status != UC_ERR_OK) err = pc_status;
     if (err != UC_ERR_OK || pc != kReturnAddress) {
         LOG_UC("[Emulator] Execution stopped with status %d: %s at PC=0x%llx (expected 0x%llx)\n",
                (int)err, uc_strerror(err), (unsigned long long)pc, (unsigned long long)kReturnAddress);
         return -1000 - (int32_t)err;
     }
 
+    // Void constructors are successful when execution returned normally;
+    // their incidental W0 value is not an initialization status.
+    if (execution_completed) *execution_completed = true;
     uint32_t w0_val = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_W0, &w0_val);
     int32_t ret_val = (int32_t)w0_val;

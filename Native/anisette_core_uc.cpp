@@ -405,9 +405,17 @@ static bool setup_vm_and_adi(
         return false;
     }
 
+    if (g_shared_vm && g_shared_vm->initialization_failed) {
+        out_err = "VM initialization previously failed; restart required";
+        return false;
+    }
     if (!g_shared_vm) {
         NativeOTPStageScope init_stage(trace, NativeOTPStage::VMInitFailed);
-        g_shared_vm = new EmulatorVM();
+        try { g_shared_vm = new EmulatorVM(); }
+        catch (const std::exception &) {
+            out_err = "VM initialization failed";
+            return false;
+        }
         init_stage.finish(NativeOTPStage::VMInitOK);
     }
     else if (trace && !isolated) trace->add(NativeOTPStage::VMReused);
@@ -430,7 +438,10 @@ static bool setup_vm_and_adi(
         NativeOTPStageScope library_stage(trace, NativeOTPStage::LibraryInitFailed);
         relocate_all_vm_libraries(vm);
         adiConsumptionPhase(ADIConsumptionDebug::Constructors);
-        run_library_constructors(vm);
+        if (!run_library_constructors(vm)) {
+            out_err = "Library constructor execution failed";
+            return false;
+        }
 
         uint64_t load_lib_ptr = get_vm_symbol_address(vm, kADISymbols.load_library);
         if (!load_lib_ptr) {

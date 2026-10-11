@@ -89,6 +89,8 @@ struct EmulatorVM {
         std::vector<std::string> needed_libs;
     };
 
+    bool initialization_failed = false;
+    bool unsupported_interrupt = false;
     bool read_only_filesystem = false;
     uc_engine *uc;
     PageAllocator heap;
@@ -118,9 +120,9 @@ struct EmulatorVM {
 
 bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std::string &so_name);
 void relocate_all_vm_libraries(EmulatorVM *vm);
-void run_library_constructors(EmulatorVM *vm);
+bool run_library_constructors(EmulatorVM *vm);
 uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name);
 
-int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us = 0, size_t max_count = 0);
+int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us = 0, size_t max_count = 0, bool *execution_completed = nullptr);
 
 #endif /* ELF_LOADER_EMULATOR_H */
