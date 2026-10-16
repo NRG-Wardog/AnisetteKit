@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include "anisette_base.h"
+#include "vm_initialization_diagnostics.h"
 extern thread_local bool g_isolated_otp_logging_suppressed;
 #define LOG_UC(...) do { if (!g_isolated_otp_logging_suppressed) anisetteCoreLog(__VA_ARGS__); } while (0)
 constexpr int UC_ERR_OK = 0;
@@ -26,6 +27,7 @@ extern std::string fault, expected_blob, expected_uuid, observed_id;
 extern bool stage_observed, require_bounded;
 void observe_native_checkpoint(const char *checkpoint);
 struct EmulatorVM {
+    bool initialization_failed = false;
     bool read_only_filesystem = false;
     uc_engine *uc;
     PageAllocator heap;
@@ -43,6 +45,6 @@ struct EmulatorVM {
 };
 bool load_library_to_vm(EmulatorVM *,const std::string &,const std::string &);
 void relocate_all_vm_libraries(EmulatorVM *);
-void run_library_constructors(EmulatorVM *);
+bool run_library_constructors(EmulatorVM *, vm_initialization_diagnostics::ConstructorFailure * = nullptr);
 uint64_t get_vm_symbol_address(EmulatorVM *, const std::string &);
 int32_t run_vm_procedure(EmulatorVM *,uint64_t,const std::vector<uint64_t> &,uint64_t = 0,size_t = 0);

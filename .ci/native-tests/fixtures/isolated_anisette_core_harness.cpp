@@ -178,7 +178,17 @@ bool load_library_to_vm(EmulatorVM *vm,const std::string &,const std::string &) 
     assert(stage_observed);return fault!="load";
 }
 void relocate_all_vm_libraries(EmulatorVM *) { ++library_relocations;observe_native_checkpoint("library.relocate"); }
-void run_library_constructors(EmulatorVM *) { ++library_constructors;observe_native_checkpoint("library.constructors"); }
+bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::ConstructorFailure *failure) {
+    if (failure) *failure = {};
+    ++library_constructors;observe_native_checkpoint("library.constructors");
+    if (fault == "constructor_diag") {
+        using namespace vm_initialization_diagnostics;
+        if (failure) *failure = {Kind::DTInitArray, Reason::EngineError, 13, 1, 2};
+        vm->initialization_failed = true;
+        return false;
+    }
+    return true;
+}
 uint64_t get_vm_symbol_address(EmulatorVM *,const std::string &name) {
     ++symbol_lookups;observe_native_checkpoint("symbol.lookup");
     const std::vector<std::string> symbols={"kq56gsgHG6","nf92ngaK92","Sph98paBcz","qi864985u0","rsegvyrt87","uv5t6nhkui"};
@@ -257,6 +267,42 @@ int main(int argc,char **argv) {
     // A warmed normal provider must survive every probe result byte-for-byte.
     auto normal=new EmulatorVM;g_shared_vm=normal;g_libraries_initialized=true;
     g_current_prov_path="unchanged-normal-path";g_current_android_id="UNCHANGEDNORMAL";
+    if (normal_mode && fault == "constructor_diag") {
+        anisetteCoreSetLogging(0);
+        delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;
+        normal_otp_checks=true;
+        char *json=nullptr;
+        const std::string directory=root+"/"+expected_uuid;
+        auto invoke=[&]() {
+            return get_anisette_headers_uc(root.c_str(),root.c_str(),uuid,
+                (const uint8_t*)expected_blob.data(),static_cast<uint32_t>(expected_blob.size()),&json);
+        };
+        assert(invoke()==ANISETTE_ERR_LOADER_FAILED && json);
+        const std::string first=json;
+        assert(first.find("\"error\":\"Library constructor execution failed [v1;kind=dt_init_array;reason=engine_error;engine=13;library=1;initializer=2]\"")!=std::string::npos);
+        const std::string trace=native_trace(json);
+#if V3_TEMPORARY_ANISETTE_TRACE_ENABLED
+        assert(trace.find("vm.init.ok,library.load.ok,library.init.failed,setup.failed")!=std::string::npos);
+        assert(trace.find("cleanup.not_requested")!=std::string::npos);
+#endif
+        assert(first.find("v2|0|0|0")!=std::string::npos);
+        assert(first.find(expected_blob)==std::string::npos && first.find(expected_uuid)==std::string::npos);
+        assert(first.find(root)==std::string::npos);
+        assert(g_shared_vm && g_shared_vm->initialization_failed && !g_libraries_initialized);
+        assert(g_current_prov_path=="unchanged-normal-path" && g_current_android_id=="UNCHANGEDNORMAL");
+        assert(normal_procedures.empty() && otp_calls==0 && provision_calls==0);
+        assert(contents(directory+"/adi.pb")==expected_blob && library_constructors==1);
+        free_c_string(json);json=nullptr;
+        assert(invoke()==ANISETTE_ERR_LOADER_FAILED && json);
+        assert(strstr(json,"VM initialization previously failed; restart required"));
+        assert(!strstr(json,"Library constructor execution failed"));
+        assert(library_constructors==1 && normal_procedures.empty() && otp_calls==0 && provision_calls==0);
+        assert(first.find("reason=engine_error;engine=13;library=1;initializer=2")!=std::string::npos);
+        assert(contents(directory+"/adi.pb")==expected_blob);
+        free_c_string(json);delete g_shared_vm;g_shared_vm=nullptr;
+        assert(unlink((directory+"/adi.pb").c_str())==0 && rmdir(directory.c_str())==0 && rmdir(root.c_str())==0);
+        puts("CONSTRUCTOR_DIAGNOSTIC_BOUNDARY_PASS");return 0;
+    }
     if(normal_mode) {
         anisetteCoreSetLogging(0);
         if(fault=="invalid") {

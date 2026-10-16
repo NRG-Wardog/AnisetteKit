@@ -1340,29 +1340,44 @@ void relocate_all_vm_libraries(EmulatorVM *vm) {
     }
 }
 
-bool run_library_constructors(EmulatorVM *vm) {
-    if (!vm || vm->initialization_failed) return false;
-    for (const auto &lib : vm->loaded_libraries) {
+bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::ConstructorFailure *failure) {
+    using namespace vm_initialization_diagnostics;
+    if (failure) *failure = {};
+    if (!vm || !vm->uc || vm->initialization_failed) {
+        if (failure) failure->reason = vm && vm->initialization_failed ? Reason::PreviouslyFailed : Reason::InvalidVM;
+        return false;
+    }
+    auto failed = [&](Kind kind, Reason reason, int engine, size_t library, size_t initializer) {
+        // Snapshot the first failure before poisoning the VM. No diagnostic
+        // state is retained by the VM or shared between calls.
+        if (failure) *failure = {kind, reason, engine, ordinal(library), ordinal(initializer)};
+        vm->initialization_failed = true;
+        return false;
+    };
+    for (size_t library = 0; library < vm->loaded_libraries.size(); ++library) {
+        const auto &lib = vm->loaded_libraries[library];
         if (lib.init_func) {
             LOG_UC("[Emulator] Calling DT_INIT at 0x%llx for '%s'...\n",
                    (unsigned long long)lib.init_func, lib.name.c_str());
             bool completed = false;
-            run_vm_procedure(vm, lib.init_func, {}, 0, 0, &completed);
-            if (!completed) { vm->initialization_failed = true; return false; }
+            ProcedureFailure execution;
+            run_vm_procedure(vm, lib.init_func, {}, 0, 0, &completed, &execution);
+            if (!completed) return failed(Kind::DTInit, execution.reason, execution.engine, library, 0);
         }
         if (lib.init_array && lib.init_arraysz) {
             size_t count = lib.init_arraysz / 8;
             for (size_t i = 0; i < count; i++) {
                 uint64_t ctor_ptr = 0;
-                if (uc_mem_read(vm->uc, lib.init_array + i * 8, &ctor_ptr, 8) != UC_ERR_OK) {
-                    vm->initialization_failed = true; return false;
-                }
+                const uc_err read_status = uc_mem_read(vm->uc, lib.init_array + i * 8, &ctor_ptr, 8);
+                if (read_status != UC_ERR_OK)
+                    return failed(Kind::ArrayEntryRead, Reason::EntryRead, static_cast<int>(read_status), library, i);
                 if (ctor_ptr != 0) {
                     LOG_UC("[Emulator] Calling DT_INIT_ARRAY[%zu] at 0x%llx for '%s'...\n",
                            i, (unsigned long long)ctor_ptr, lib.name.c_str());
                     bool completed = false;
-                    run_vm_procedure(vm, ctor_ptr, {}, 0, 0, &completed);
-                    if (!completed) { vm->initialization_failed = true; return false; }
+                    ProcedureFailure execution;
+                    run_vm_procedure(vm, ctor_ptr, {}, 0, 0, &completed, &execution);
+                    if (!completed) return failed(Kind::DTInitArray, execution.reason, execution.engine, library, i);
                 }
             }
         }
@@ -1378,9 +1393,14 @@ uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name) {
     return 0;
 }
 
-int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us, size_t max_count, bool *execution_completed) {
+int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us, size_t max_count, bool *execution_completed, vm_initialization_diagnostics::ProcedureFailure *failure) {
+    using namespace vm_initialization_diagnostics;
     if (execution_completed) *execution_completed = false;
-    if (!vm || vm->initialization_failed || !proc_addr) return -1;
+    if (failure) *failure = {};
+    if (!vm || !vm->uc || vm->initialization_failed || !proc_addr) {
+        if (failure) failure->reason = vm && vm->initialization_failed ? Reason::PreviouslyFailed : Reason::InvalidVM;
+        return -1;
+    }
     // V3_ISOLATED_ANISETTE_OTP_V1: a temporary VM must not leave a dangling fallback.
     struct ActiveVMScope {
         EmulatorVM *previous;
@@ -1431,13 +1451,20 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
            (unsigned long long)proc_addr, first_insn, (unsigned long long)stack_top, (unsigned long long)kReturnAddress);
 
     vm->unsupported_interrupt = false;
-    uc_err err = uc_emu_start(vm->uc, proc_addr, kReturnAddress, timeout_us, max_count);
+    const uc_err engine_status = uc_emu_start(vm->uc, proc_addr, kReturnAddress, timeout_us, max_count);
+    uc_err err = engine_status;
     if (err == UC_ERR_OK && vm->unsupported_interrupt) err = UC_ERR_EXCEPTION;
 
     uint64_t pc = 0;
     const uc_err pc_status = uc_reg_read(vm->uc, UC_ARM64_REG_PC, &pc);
     if (err == UC_ERR_OK && pc_status != UC_ERR_OK) err = pc_status;
     if (err != UC_ERR_OK || pc != kReturnAddress) {
+        if (failure) {
+            failure->reason = vm->unsupported_interrupt ? Reason::UnsupportedInterrupt :
+                (err != UC_ERR_OK ? Reason::EngineError : Reason::UnexpectedReturn);
+            // Report the real API status, not the synthetic return encoding or W0.
+            failure->engine = static_cast<int>(vm->unsupported_interrupt ? engine_status : err);
+        }
         LOG_UC("[Emulator] Execution stopped with status %d: %s at PC=0x%llx (expected 0x%llx)\n",
                (int)err, uc_strerror(err), (unsigned long long)pc, (unsigned long long)kReturnAddress);
         return -1000 - (int32_t)err;

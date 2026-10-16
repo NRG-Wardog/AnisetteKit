@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <unicorn/unicorn.h>
 #include "anisette_base.h"
+#include "vm_initialization_diagnostics.h"
 
 extern thread_local bool g_isolated_otp_logging_suppressed;
 #define LOG_UC(...) do { if (!g_isolated_otp_logging_suppressed) anisetteCoreLog(__VA_ARGS__); } while (0)
@@ -120,9 +121,9 @@ struct EmulatorVM {
 
 bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std::string &so_name);
 void relocate_all_vm_libraries(EmulatorVM *vm);
-bool run_library_constructors(EmulatorVM *vm);
+bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::ConstructorFailure *failure = nullptr);
 uint64_t get_vm_symbol_address(EmulatorVM *vm, const std::string &name);
 
-int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us = 0, size_t max_count = 0, bool *execution_completed = nullptr);
+int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<uint64_t> &args, uint64_t timeout_us = 0, size_t max_count = 0, bool *execution_completed = nullptr, vm_initialization_diagnostics::ProcedureFailure *failure = nullptr);
 
 #endif /* ELF_LOADER_EMULATOR_H */

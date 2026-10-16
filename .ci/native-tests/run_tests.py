@@ -82,6 +82,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         cls.build = Path(cls.temporary.name)
         (cls.build / 'Loader').mkdir()
         shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', cls.build / 'Loader/adi_consumption_debug.h')
+        shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', cls.build / 'Loader/vm_initialization_diagnostics.h')
         (cls.build / 'Loader/elf_loader_emulator.h').write_text(
             (HERE / 'fixtures/isolated_anisette_vm_double.h').read_text())
         for name in ('Native/anisette_base.h', 'Native/anisette_base.cpp',
@@ -183,6 +184,11 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('NORMAL_ALLOCATION_FD_PASS', result.stdout)
 
+    def test_constructor_diagnostic_reaches_actual_json_boundary_and_preserves_poison(self):
+        result = subprocess.run([str(self.executable), 'normal_constructor_diag'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('CONSTRUCTOR_DIAGNOSTIC_BOUNDARY_PASS', result.stdout)
+
     def test_native_trace_is_bounded_and_can_be_disabled_without_changing_results(self):
         result = subprocess.run([str(self.executable), 'tracecap'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -204,6 +210,9 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('NATIVE_TRACE=disabled', result.stdout)
                 self.assertNotIn('NATIVE_TRACE=arguments', result.stdout)
+            result = subprocess.run([str(binary), 'normal_constructor_diag'], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('CONSTRUCTOR_DIAGNOSTIC_BOUNDARY_PASS', result.stdout)
         finally:
             core.write_text(enabled)
 
@@ -222,9 +231,11 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             (build / 'Loader').mkdir()
             (build / 'unicorn').mkdir()
             (build / 'Loader/elf_loader_emulator.h').write_text(source('Native/Loader/elf_loader_emulator.h'))
+            shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', build / 'Loader/vm_initialization_diagnostics.h')
+            shutil.copyfile(ROOT / 'Native/Loader/android_tls_runtime.h', build / 'android_tls_runtime.h')
             for path in ('Native/anisette_base.h', 'Native/include/anisette_core.h', 'Native/anisette_base.cpp'):
                 (build / Path(path).name).write_text(source(path))
-            constants = sorted(set(re.findall(r'\bUC_[A-Z0-9_]+\b', functions)))
+            constants = sorted(set(re.findall(r'\bUC_[A-Z0-9_]+\b', functions + source('Native/Loader/android_tls_runtime.h'))))
             # SIMD register constants must form the real contiguous range.
             constants = [x for x in constants if not x.startswith('UC_ARM64_REG_V')]
             constants += ['UC_ARM64_REG_V' + str(n) for n in range(32)]
@@ -233,6 +244,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             header += 'enum { UC_ERR_OK=0, ' + ', '.join(constants) + ' };\n'
             header += '''uc_err uc_open(int,int,uc_engine**);uc_err uc_close(uc_engine*);
 uc_err uc_mem_map(uc_engine*,uint64_t,size_t,int);
+uc_err uc_mem_unmap(uc_engine*,uint64_t,size_t);
 uc_err uc_mem_write(uc_engine*,uint64_t,const void*,size_t);
 uc_err uc_mem_read(uc_engine*,uint64_t,void*,size_t);
 uc_err uc_reg_write(uc_engine*,int,const void*);uc_err uc_reg_read(uc_engine*,int,void*);
@@ -241,8 +253,9 @@ uc_err uc_emu_start(uc_engine*,uint64_t,uint64_t,uint64_t,size_t);
 const char* uc_strerror(uc_err);
 '''
             (build / 'unicorn/unicorn.h').write_text(header)
+            (build / 'unicorn/arm64.h').write_text('#include "unicorn.h"\n')
             shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
-            (build / 'loader_functions.inc').write_text('#include \"adi_consumption_debug.h\"\n' + functions)
+            (build / 'loader_functions.inc').write_text('#include "adi_consumption_debug.h"\n#include "android_tls_runtime.h"\n' + functions)
             (build / 'main.cpp').write_text((HERE / 'fixtures/isolated_anisette_loader_harness.cpp').read_text())
             binary = build / 'loader-test'
             compiled = subprocess.run([compiler, '-std=c++17', '-I', str(build), str(build / 'main.cpp'),

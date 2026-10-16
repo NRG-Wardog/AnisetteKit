@@ -14,6 +14,7 @@
 #include <memory>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include "Loader/elf_loader_emulator.h"
 
 static int fault_step=0, api_step=0, closed_engines=0;
@@ -47,6 +48,7 @@ static bool fail_api() { return ++api_step==fault_step; }
 uc_err uc_open(int,int,uc_engine **out) { if(fail_api())return 1;*out=new uc_engine;return 0; }
 uc_err uc_close(uc_engine *uc) { ++closed_engines;delete uc;return 0; }
 uc_err uc_mem_map(uc_engine *,uint64_t,size_t,int) { return fail_api()?1:0; }
+uc_err uc_mem_unmap(uc_engine *,uint64_t,size_t) { return 0; }
 uc_err uc_hook_add(uc_engine *,uc_hook*,int,void*,void*,uint64_t,uint64_t) { return fail_api()?1:0; }
 uc_err uc_mem_write(uc_engine *uc,uint64_t p,const void *data,size_t n) {
     if(fail_api())return 1;for(size_t i=0;i<n;++i)uc->memory[p+i]=((const uint8_t*)data)[i];return 0;

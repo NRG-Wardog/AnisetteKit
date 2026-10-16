@@ -18,6 +18,32 @@ synthetic data and do not call Apple. The existing Swift cleanup lifetime race
 is intentionally unchanged. Full `swift test`, Xcode/iOS and real-device Apple
 authentication remain separate required checks.
 
+Constructor diagnostics: `test_constructor_diagnostics.py --unicorn-root PATH`
+links the full production loader to an explicitly selected installed Unicorn
+engine and runs only owned synthetic AArch64 instructions. Add `--sanitizers`
+for ASan/UBSan, and `--output FILE` for hashes and results. Only use
+`--disable-leak-sanitizer` when the executor prevents LSan; the result discloses
+that override. The platform gate can compile `fixtures/constructor_diagnostics.cpp`
+directly against the same pinned native framework used for the existing
+83-check `android_tls_constructor.cpp` fixture. Its stdout is one JSON line:
+schema 1, positive `checks`, zero `failures` and `skipped`, finite `case_ids`,
+`ADI_executed=false`, and `device_validation=false`.
+The standalone driver enforces the sealed 2,105-check/15-case result exactly,
+including types and keys, and rejects any fixture stderr. Sanitizer builds use
+`-fno-sanitize-recover=all` and fail-fast runtime options. Run
+`python3 .ci/native-tests/test_constructor_diagnostics_driver.py` for the separate
+six-case parser/sanitizer-option rejection suite; it does not change the
+eight-case aggregate suite.
+
+The new observer is caller-owned and does not change constructor success, which
+still requires normal return regardless of incidental W0. It captures first
+failure before poisoning; later calls keep the existing fail-closed behavior.
+The actual wrapper JSON-boundary test covers the canonical error, appended
+trace, no ADI execution, unchanged identity caches, and poisoned retry rejection.
+See [CONSTRUCTOR_DIAGNOSTICS.md](CONSTRUCTOR_DIAGNOSTICS.md) for the finite wire
+contract. Synthetic or upstream-engine results never establish native-fork or
+real-device compatibility.
+
 Provenance: the runtime fault matrices and test doubles were ported from
 NRG-Wardog/sidestore-auto-refresh at
 141776ba6ba38fc04a5e77f68b0cfc4e6c8842ee. The original MIT attribution is in

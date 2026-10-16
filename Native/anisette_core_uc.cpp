@@ -438,8 +438,9 @@ static bool setup_vm_and_adi(
         NativeOTPStageScope library_stage(trace, NativeOTPStage::LibraryInitFailed);
         relocate_all_vm_libraries(vm);
         adiConsumptionPhase(ADIConsumptionDebug::Constructors);
-        if (!run_library_constructors(vm)) {
-            out_err = "Library constructor execution failed";
+        vm_initialization_diagnostics::ConstructorFailure constructor_failure;
+        if (!run_library_constructors(vm, &constructor_failure)) {
+            out_err = vm_initialization_diagnostics::description(constructor_failure);
             return false;
         }
 
