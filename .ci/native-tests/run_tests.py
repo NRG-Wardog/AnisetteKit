@@ -99,6 +99,13 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         if b'V3_CHECKED_ANISETTE_STAGING_V1' not in cls.executable.read_bytes():
             raise AssertionError('Compiled checked normal staging marker absent')
 
+    def test_fresh_provisioning_constructor_failure_is_correlated_and_redacted(self):
+        result = subprocess.run([str(self.executable), 'normal_fresh_constructor_diag'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FRESH_CONSTRUCTOR_TRACE_PASS', result.stdout)
+        for private in ('SYNTHETIC-EXISTING-BLOB', 'isolated-adi-test-', '0001020304050607', 'PASSWORD-CANARY', 'TOKEN-CANARY'):
+            self.assertNotIn(private, result.stdout + result.stderr)
+
     def test_actual_native_boundary_success_faults_and_concurrent_calls(self):
         for fault in ('ok', 'concurrent', 'mixed', 'mkdir', 'open', 'fdopen', 'write', 'flush', 'close',
                       'readopen', 'read', 'mismatch', 'rename', 'construct', 'load', 'setup',

@@ -27,6 +27,7 @@ extension AnisetteDataProvider {
         var dict = try parseJSONString(String(cString: ptr))
         let temporaryTrace = dict.removeValue(forKey: "v3_native_trace")
         let consumptionTrace = dict.removeValue(forKey: "v3_native_consumption")
+        LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace"))
         if let err = dict["error"] {
             throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace) + TemporaryADIConsumptionTrace.suffix(consumptionTrace))
         }
@@ -38,11 +39,13 @@ extension AnisetteDataProvider {
             throw AnisetteError.loaderFailed(reason: "\(providerName) loader returned nil (code: \(code))")
         }
         let jsonData = String(cString: ptr).data(using: .utf8)!
-        guard let dict = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+        guard var dict = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
             throw AnisetteError.invalidResponse(reason: "Bad JSON from start_provision")
         }
+        let temporaryTrace = dict.removeValue(forKey: "v3_native_trace") as? String
+        LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace") as? String)
         if let err = dict["error"] as? String {
-            throw AnisetteError.adiError(code: code, description: err)
+            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
         }
         guard let cpimBase64 = dict["cpim_base64"] as? String,
               let cpim = Data(base64Encoded: cpimBase64),
@@ -57,9 +60,11 @@ extension AnisetteDataProvider {
         guard let ptr = outPtr else {
             throw AnisetteError.loaderFailed(reason: "\(providerName) loader returned nil (code: \(code))")
         }
-        let dict = try parseJSONString(String(cString: ptr))
+        var dict = try parseJSONString(String(cString: ptr))
+        let temporaryTrace = dict.removeValue(forKey: "v3_native_trace")
+        LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace"))
         if let err = dict["error"] {
-            throw AnisetteError.adiError(code: code, description: err)
+            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
         }
         guard let adiPbBase64 = dict["adi_pb_base64"], let adiPb = Data(base64Encoded: adiPbBase64) else {
             throw AnisetteError.invalidResponse(reason: "Missing/invalid adi_pb_base64")
@@ -132,7 +137,7 @@ public struct NativeAnisetteDataProvider: AnisetteDataProvider {
 // DEBUG/TEMPORARY: diagnostic metadata belongs to one response, never headers.
 private enum TemporaryAnisetteNativeTrace {
     static let enabled = true
-    static let allowed: Set<String> = ["arguments.ok", "arguments.failed", "root.ok", "root.failed", "uuid_dir.created", "uuid_dir.exists", "uuid_dir.failed", "file.open.ok", "file.open.failed", "file.stream.ok", "file.stream.failed", "file.write.ok", "file.write.failed", "file.flush.ok", "file.flush.failed", "file.flush.not_checked", "file.close.ok", "file.close.failed", "file.read_open.ok", "file.read_open.failed", "file.readback.ok", "file.readback.failed", "file.readback.not_checked", "file.read_close.ok", "file.read_close.failed", "file.rename.ok", "file.rename.failed", "vm.init.ok", "vm.init.failed", "vm.reused", "setup.begin", "setup.ok", "setup.failed", "library.load.ok", "library.load.failed", "library.cached", "library.init.ok", "library.init.failed", "provisioning_path.ok", "provisioning_path.failed", "provisioning_path.cached", "android_id.ok", "android_id.failed", "android_id.cached", "native.symbol.ok", "native.symbol.failed", "native.otp.ok", "native.otp.failed", "native.output.ok", "native.output.failed", "native.output.not_checked", "cleanup.ok", "cleanup.failed", "cleanup.not_needed", "cleanup.not_requested", "response.allocation.failed", "trace.truncated"]
+    static let allowed: Set<String> = ["arguments.ok", "arguments.failed", "root.ok", "root.failed", "uuid_dir.created", "uuid_dir.exists", "uuid_dir.failed", "file.open.ok", "file.open.failed", "file.stream.ok", "file.stream.failed", "file.write.ok", "file.write.failed", "file.flush.ok", "file.flush.failed", "file.flush.not_checked", "file.close.ok", "file.close.failed", "file.read_open.ok", "file.read_open.failed", "file.readback.ok", "file.readback.failed", "file.readback.not_checked", "file.read_close.ok", "file.read_close.failed", "file.rename.ok", "file.rename.failed", "vm.init.ok", "vm.init.failed", "vm.reused", "setup.begin", "setup.ok", "setup.failed", "library.load.ok", "library.load.failed", "library.cached", "library.init.ok", "library.init.failed", "provisioning_path.ok", "provisioning_path.failed", "provisioning_path.cached", "android_id.ok", "android_id.failed", "android_id.cached", "native.symbol.ok", "native.symbol.failed", "native.otp.ok", "native.otp.failed", "native.start.ok", "native.start.failed", "native.end.ok", "native.end.failed", "native.output.ok", "native.output.failed", "native.output.not_checked", "cleanup.ok", "cleanup.failed", "cleanup.not_needed", "cleanup.not_requested", "response.allocation.failed", "trace.truncated"]
 
     static func suffix(_ value: String?) -> String {
         guard enabled, let value, !value.isEmpty, value.utf8.count <= 1024,

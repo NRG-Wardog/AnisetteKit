@@ -252,6 +252,16 @@ static std::string native_trace(const char *json) {
             std::string("AQID"),std::string("BAUG"),std::string("X-Apple-I-MD"),
             std::string("PASSWORD-CANARY"),std::string("TOKEN-CANARY")})
         if(!private_value.empty())assert(value.find(private_value)==std::string::npos);
+    const char *timing_prefix="\"v3_login_native_trace\":\"";
+    if(const char *timing=strstr(json,timing_prefix)) {
+        timing+=strlen(timing_prefix);const char *end=strchr(timing,'"');assert(end);
+        const std::string numeric(timing,end);
+        assert(numeric.size()<=2055 && numeric.rfind("v1;",0)==0);
+        assert(numeric.find_first_not_of("v0123456789;,")==std::string::npos);
+        assert(std::count(numeric.begin(),numeric.end(),';')<=65);
+        for(const auto &secret:{expected_blob,expected_uuid,root,std::string("PASSWORD-CANARY"),std::string("TOKEN-CANARY")})
+            if(!secret.empty())assert(numeric.find(secret)==std::string::npos);
+    }
     return value;
 #else
     assert(!start);return "disabled";
@@ -267,6 +277,23 @@ int main(int argc,char **argv) {
     // A warmed normal provider must survive every probe result byte-for-byte.
     auto normal=new EmulatorVM;g_shared_vm=normal;g_libraries_initialized=true;
     g_current_prov_path="unchanged-normal-path";g_current_android_id="UNCHANGEDNORMAL";
+    if (normal_mode && fault == "fresh_constructor_diag") {
+        anisetteCoreSetLogging(0);
+        delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;
+        fault="constructor_diag";
+        const uint8_t spim[]={10,11};char *json=nullptr;
+        assert(start_provision_uc(root.c_str(),root.c_str(),uuid,spim,sizeof(spim),&json)==ANISETTE_ERR_LOADER_FAILED);
+        assert(json && strstr(json,"initializer=2"));
+        const auto trace=native_trace(json);
+        assert(trace.find("library.init.failed")!=std::string::npos);
+        assert(trace.find("setup.failed")!=std::string::npos);
+        assert(strstr(json,"\"v3_login_native_trace\":\"v1;"));
+        assert(strstr(json,"3,2,") && provision_calls==0 && otp_calls==0);
+        free_c_string(json);
+        assert(g_shared_vm && g_shared_vm->initialization_failed);
+        delete g_shared_vm;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+        puts("FRESH_CONSTRUCTOR_TRACE_PASS");return 0;
+    }
     if (normal_mode && fault == "constructor_diag") {
         anisetteCoreSetLogging(0);
         delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;
@@ -412,7 +439,13 @@ int main(int argc,char **argv) {
             assert(end_provision_uc(root.c_str(),root.c_str(),uuid,42,ptm,sizeof(ptm),tk,sizeof(tk),&json)==0);
             const std::string provision_response="{\"adi_pb_base64\":\""+
                 base64_encode(reinterpret_cast<const uint8_t *>(expected_blob.data()),expected_blob.size())+"\"}";
-            assert(json && json==provision_response);free_c_string(json);
+            assert(json);
+            std::string payload(json);
+            const auto metadata = payload.find(",\"v3_native_trace\":");
+            if (metadata != std::string::npos) payload = payload.substr(0, metadata) + "}";
+            assert(payload==provision_response);
+            assert(native_trace(json).find("native.end.ok")!=std::string::npos);
+            free_c_string(json);
             assert(contents(destination)==expected_blob && otp_calls==0 && provision_calls==2);
             assert((normal_procedures==std::vector<uint64_t>{1,2,3,5,6}));
             assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
@@ -610,7 +643,11 @@ int main(int argc,char **argv) {
         char *json=strdup("{\"error\":\"synthetic\"}");
         {
             NativeOTPTrace trace(&json);
-            for(int i=0;i<10000;++i)trace.add(NativeOTPStage::ArgumentsOK);
+            for(int i=0;i<10000;++i) {
+                trace.add(NativeOTPStage::ArgumentsOK);
+                trace.timed(3, 2, NativeOTPTrace::Clock::now());
+            }
+            assert(trace.timing_count<=64 && trace.timing_length<=2048 && trace.timing_truncated);
 #if !V3_TEMPORARY_ANISETTE_TRACE_ENABLED
             assert(trace.count==0 && trace.length==0);
 #endif
@@ -630,7 +667,12 @@ int main(int argc,char **argv) {
         int result=get_anisette_headers_isolated_uc(root.c_str(),root.c_str(),uuid,
             (const uint8_t*)expected_blob.data(),len,&json);
         if(fault=="ok"||fault=="concurrent"||fault=="mixed")assert(result==0 && json && strstr(json,"AQID"));
-        else if(fault=="otp")assert(result==-45061);
+        else if(fault=="otp") {
+            assert(result==-45061);
+#if V3_TEMPORARY_ANISETTE_TRACE_ENABLED
+            assert(json && strstr(json,";7,2,"));
+#endif
+        }
         else assert(result!=0);
         assert(json && !strstr(json,"SYNTHETIC-EXISTING-BLOB"));
         printf("NATIVE_TRACE=%s\n",native_trace(json).c_str());free_c_string(json);

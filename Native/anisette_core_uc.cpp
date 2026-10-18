@@ -42,6 +42,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <errno.h>
+#include <chrono>
 
 #define V3_TEMPORARY_ANISETTE_TRACE_ENABLED 1
 // DEBUG/TEMPORARY: remove after the Anisette failure is diagnosed.
@@ -59,7 +60,7 @@ enum class NativeOTPStage {
     LibraryLoadOK, LibraryLoadFailed, LibraryCached, LibraryInitOK, LibraryInitFailed,
     ProvisioningPathOK, ProvisioningPathFailed, ProvisioningPathCached,
     AndroidIDOK, AndroidIDFailed, AndroidIDCached,
-    NativeSymbolOK, NativeSymbolFailed, NativeOTPOK, NativeOTPFailed,
+    NativeSymbolOK, NativeSymbolFailed, NativeOTPOK, NativeOTPFailed, NativeStartOK, NativeStartFailed, NativeEndOK, NativeEndFailed,
     NativeOutputOK, NativeOutputFailed, NativeOutputUnchecked,
     CleanupOK, CleanupFailed, CleanupNotNeeded, CleanupNotRequested, ResponseAllocationFailed, Truncated
 };
@@ -71,10 +72,38 @@ struct NativeOTPTrace {
     char value[max_bytes + 1] = {};
     size_t count = 0, length = 0;
     char **output;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point began = Clock::now();
+    char timing[2049] = {};
+    size_t timing_length = 0, timing_count = 0;
+    bool timing_truncated = false;
+    static uint64_t ms(Clock::time_point end, Clock::time_point begin) noexcept {
+        const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+        return value < 0 ? 0 : std::min<uint64_t>(static_cast<uint64_t>(value), 86400000);
+    }
+    void timed(int stage, int outcome, Clock::time_point start) noexcept {
+        if (stage < 0) return;
+        if (timing_count >= 64) { timing_truncated = true; return; }
+        const auto now = Clock::now();
+        char row[80];
+        const int n = snprintf(row, sizeof(row), "%s%d,%d,%llu,%llu", timing_count ? ";" : "",
+            stage, outcome, static_cast<unsigned long long>(ms(now, began)),
+            static_cast<unsigned long long>(ms(now, start)));
+        if (n < 0 || static_cast<size_t>(n) >= sizeof(row) || timing_length + n >= sizeof(timing)) {
+            timing_truncated = true; return;
+        }
+        memcpy(timing + timing_length, row, n + 1); timing_length += n; ++timing_count;
+    }
     explicit NativeOTPTrace(char **out) : output(out) {}
 
     void add(NativeOTPStage stage) noexcept {
 #if V3_TEMPORARY_ANISETTE_TRACE_ENABLED
+        if (stage == NativeOTPStage::VMReused) timed(1, 3, Clock::now());
+        if (stage == NativeOTPStage::LibraryCached) timed(2, 3, Clock::now());
+        if (stage == NativeOTPStage::ProvisioningPathCached) timed(4, 3, Clock::now());
+        if (stage == NativeOTPStage::AndroidIDCached) timed(5, 3, Clock::now());
+        if (stage == NativeOTPStage::NativeOutputUnchecked) timed(8, 3, Clock::now());
+        if (stage == NativeOTPStage::CleanupNotRequested || stage == NativeOTPStage::CleanupNotNeeded) timed(9, 3, Clock::now());
         static const char *const tokens[] = {
             "arguments.ok", "arguments.failed", "root.ok", "root.failed",
             "uuid_dir.created", "uuid_dir.exists", "uuid_dir.failed",
@@ -87,7 +116,7 @@ struct NativeOTPTrace {
             "library.load.ok", "library.load.failed", "library.cached", "library.init.ok", "library.init.failed",
             "provisioning_path.ok", "provisioning_path.failed", "provisioning_path.cached",
             "android_id.ok", "android_id.failed", "android_id.cached",
-            "native.symbol.ok", "native.symbol.failed", "native.otp.ok", "native.otp.failed",
+            "native.symbol.ok", "native.symbol.failed", "native.otp.ok", "native.otp.failed", "native.start.ok", "native.start.failed", "native.end.ok", "native.end.failed",
             "native.output.ok", "native.output.failed", "native.output.not_checked",
             "cleanup.ok", "cleanup.failed", "cleanup.not_needed", "cleanup.not_requested", "response.allocation.failed", "trace.truncated"
         };
@@ -116,13 +145,23 @@ struct NativeOTPTrace {
         // This is private metadata, removed by Swift before constructing headers.
         // All trace bytes come from the finite literal table above.
         const char prefix[] = ",\"v3_native_trace\":\"";
-        char *combined = static_cast<char *>(malloc(original_length + sizeof(prefix) + length + 3));
+        const char timing_prefix[] = ",\"v3_login_native_trace\":\"v1;";
+        char *combined = static_cast<char *>(malloc(original_length + sizeof(prefix) + length +
+            sizeof(timing_prefix) + timing_length + 10));
         if (!combined) return; // Diagnostics must not change the original result.
         memcpy(combined, *output, original_length - 1);
         size_t cursor = original_length - 1;
         memcpy(combined + cursor, prefix, sizeof(prefix) - 1); cursor += sizeof(prefix) - 1;
         memcpy(combined + cursor, value, length); cursor += length;
-        memcpy(combined + cursor, "\"}", 3);
+        combined[cursor++] = '"';
+        if (timing_count) {
+            memcpy(combined + cursor, timing_prefix, sizeof(timing_prefix) - 1); cursor += sizeof(timing_prefix) - 1;
+            combined[cursor++] = timing_truncated ? '1' : '0';
+            combined[cursor++] = ';';
+            memcpy(combined + cursor, timing, timing_length); cursor += timing_length;
+            combined[cursor++] = '"';
+        }
+        memcpy(combined + cursor, "}", 2);
         free_c_string(*output);
         *output = combined;
 #endif
@@ -133,12 +172,47 @@ struct NativeOTPStageScope {
     NativeOTPTrace *trace;
     NativeOTPStage failure;
     bool completed = false;
-    NativeOTPStageScope(NativeOTPTrace *owner, NativeOTPStage failed) : trace(owner), failure(failed) {}
+    NativeOTPTrace::Clock::time_point started = NativeOTPTrace::Clock::now();
+    int diagnostic_stage;
+    static int stage_id(NativeOTPStage failed) noexcept {
+        switch (failed) {
+        case NativeOTPStage::SetupFailed: return 0;
+        case NativeOTPStage::VMInitFailed: return 1;
+        case NativeOTPStage::LibraryLoadFailed: return 2;
+        case NativeOTPStage::LibraryInitFailed: return 3;
+        case NativeOTPStage::ProvisioningPathFailed: return 4;
+        case NativeOTPStage::AndroidIDFailed: return 5;
+        case NativeOTPStage::NativeSymbolFailed: return 6;
+        case NativeOTPStage::NativeOTPFailed: return 7;
+        case NativeOTPStage::NativeOutputFailed: return 8;
+        case NativeOTPStage::CleanupFailed: return 9;
+        case NativeOTPStage::NativeStartFailed: return 10;
+        case NativeOTPStage::NativeEndFailed: return 11;
+        default: return -1;
+        }
+    }
+    NativeOTPStageScope(NativeOTPTrace *owner, NativeOTPStage failed)
+        : trace(owner), failure(failed), diagnostic_stage(stage_id(failed)) {
+        if (trace) trace->timed(diagnostic_stage, 0, started);
+    }
     void finish(NativeOTPStage outcome) noexcept {
-        if (trace) trace->add(outcome);
+        if (trace) { trace->add(outcome); trace->timed(diagnostic_stage, outcome == failure ? 2 : 1, started); }
         completed = true;
     }
-    ~NativeOTPStageScope() { if (!completed && trace) trace->add(failure); }
+    ~NativeOTPStageScope() { if (!completed && trace) { trace->add(failure); trace->timed(diagnostic_stage, 2, started); } }
+};
+
+// Numeric-only timing scopes refine the existing broad library.init token.
+struct NativeLoginTimingScope {
+    NativeOTPTrace *trace;
+    int stage;
+    NativeOTPTrace::Clock::time_point started = NativeOTPTrace::Clock::now();
+    bool completed = false;
+    NativeLoginTimingScope(NativeOTPTrace *owner, int value) : trace(owner), stage(value) {
+        if (trace) trace->timed(stage, 0, started);
+    }
+    void finish() noexcept { if (trace) trace->timed(stage, 1, started); completed = true; }
+    ~NativeLoginTimingScope() { if (!completed && trace) trace->timed(stage, 2, started); }
 };
 
 // The active normal-provider fix. This does not replace its VM or identity.
@@ -436,11 +510,14 @@ static bool setup_vm_and_adi(
 
         load_stage.finish(NativeOTPStage::LibraryLoadOK);
         NativeOTPStageScope library_stage(trace, NativeOTPStage::LibraryInitFailed);
+        NativeLoginTimingScope relocation_timing(trace, 12);
         relocate_all_vm_libraries(vm);
         if (vm->initialization_failed) {
             out_err = "Failed to relocate libraries into VM";
             return false;
         }
+        relocation_timing.finish();
+        NativeLoginTimingScope constructor_timing(trace, 13);
         adiConsumptionPhase(ADIConsumptionDebug::Constructors);
         vm_initialization_diagnostics::ConstructorFailure constructor_failure;
         if (!run_library_constructors(vm, &constructor_failure)) {
@@ -448,6 +525,7 @@ static bool setup_vm_and_adi(
             return false;
         }
 
+        constructor_timing.finish();
         uint64_t load_lib_ptr = get_vm_symbol_address(vm, kADISymbols.load_library);
         if (!load_lib_ptr) {
             out_err = "Required ADI setup symbol missing in VM";
@@ -455,15 +533,16 @@ static bool setup_vm_and_adi(
         }
 
         uint64_t lib_path_vm = vm->write_string(lib_path.c_str());
-        LOG_UC("[AnisetteKit - UC] Step 1: Calling ADILoadLibraryWithPath (0x%llx, path=\"%s\")...\n",
-               (unsigned long long)load_lib_ptr, lib_path.c_str());
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         adiConsumptionPhase(ADIConsumptionDebug::LibraryInit);
+        NativeLoginTimingScope load_call_timing(trace, 14);
         int32_t load_res = run_vm_procedure(vm, load_lib_ptr, {lib_path_vm, 0}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Step 1 result: %d\n", load_res);
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         if (load_res != 0) {
             out_err = "ADILoadLibraryWithPath failed: " + std::to_string(load_res);
             return false;
         }
+        load_call_timing.finish();
         g_libraries_initialized = true;
         library_stage.finish(NativeOTPStage::LibraryInitOK);
     }
@@ -489,11 +568,10 @@ static bool setup_vm_and_adi(
             return false;
         }
         uint64_t prov_path_vm = vm->write_string(out_uuid_prov_dir.c_str());
-        LOG_UC("[AnisetteKit - UC] Step 2: Calling ADISetProvisioningPath (0x%llx, path=\"%s\")...\n",
-               (unsigned long long)set_prov_ptr, out_uuid_prov_dir.c_str());
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         adiConsumptionPhase(ADIConsumptionDebug::ProvisioningPath);
         int32_t prov_res = run_vm_procedure(vm, set_prov_ptr, {prov_path_vm}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Step 2 result: %d\n", prov_res);
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         if (prov_res != 0) {
             out_err = "ADISetProvisioningPath failed: " + std::to_string(prov_res);
             return false;
@@ -513,11 +591,10 @@ static bool setup_vm_and_adi(
             return false;
         }
         uint64_t android_id_vm = vm->write_string(android_id.c_str());
-        LOG_UC("[AnisetteKit - UC] Step 3: Calling ADISetAndroidID (0x%llx, id=\"%s\", len=%zu)...\n",
-               (unsigned long long)set_id_ptr, android_id.c_str(), android_id.length());
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         adiConsumptionPhase(ADIConsumptionDebug::AndroidID);
         int32_t id_res = run_vm_procedure(vm, set_id_ptr, {android_id_vm, (uint64_t)android_id.length()}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Step 3 result: %d\n", id_res);
+        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
         if (id_res != 0) {
             out_err = "ADISetAndroidID failed: " + std::to_string(id_res);
             return false;
@@ -545,7 +622,6 @@ static int32_t get_anisette_headers_uc_locked(
 ) {
     LOG_UC("[AnisetteKit - UC] Invoked get_anisette_headers_uc\n");
     if (!lib_dir || !provisioning_dir || !identifier || !adi_pb || !out_json) {
-        trace.add(NativeOTPStage::ArgumentsFailed);
         return ANISETTE_ERR_INVALID_ARGUMENT;
     }
 
@@ -602,11 +678,11 @@ static int32_t get_anisette_headers_uc_locked(
     uint64_t otp_len_ptr = vm->heap.alloc(4);
 
     uint64_t dsid = (uint64_t)-2;
-    LOG_UC("[AnisetteKit - UC] Step 4: Calling ADIOTPRequest (0x%llx)...\n", (unsigned long long)otp_req_ptr);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
     NativeOTPStageScope otp_stage(&trace, NativeOTPStage::NativeOTPFailed);
     adiConsumptionPhase(ADIConsumptionDebug::OTP);
     int32_t res = run_vm_procedure(vm, otp_req_ptr, {dsid, mid_ptr, mid_len_ptr, otp_ptr, otp_len_ptr}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-    LOG_UC("[AnisetteKit - UC] Step 4 result: %d\n", res);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
 
     otp_stage.finish(res == 0 ? NativeOTPStage::NativeOTPOK : NativeOTPStage::NativeOTPFailed);
     if (res != 0) {
@@ -888,11 +964,14 @@ int32_t start_provision_uc(
         return ANISETTE_ERR_INVALID_ARGUMENT;
     }
 
+    *out_json = nullptr;
+    NativeOTPTrace trace(out_json);
+    trace.add(NativeOTPStage::ArgumentsOK);
     std::lock_guard<std::mutex> lock(g_vm_mutex);
 
     EmulatorVM *vm = nullptr;
     std::string uuid_prov_dir, err;
-    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err)) {
+    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err, false, &trace)) {
         std::stringstream ss;
         ss << "{\"error\":\"" << err << "\"}";
         *out_json = strdup(ss.str().c_str());
@@ -902,9 +981,11 @@ int32_t start_provision_uc(
     uint64_t prov_start_ptr = get_vm_symbol_address(vm, kADISymbols.provisioning_start);
     if (!prov_start_ptr) {
         *out_json = strdup("{\"error\":\"Symbol ADIProvisioningStart missing\"}");
+        trace.add(NativeOTPStage::NativeSymbolFailed);
         return ANISETTE_ERR_SYMBOL_MISSING;
     }
 
+    trace.add(NativeOTPStage::NativeSymbolOK);
     uint64_t spim_vm = vm->write_bytes(spim, spim_len);
     uint64_t cpim_ptr = vm->heap.alloc(8);
     uint64_t cpim_len_ptr = vm->heap.alloc(4);
@@ -917,10 +998,10 @@ int32_t start_provision_uc(
     uc_mem_write(vm->uc, session_ptr, &zero32, sizeof(zero32));
 
     uint64_t dsid = (uint64_t)-2;
-    LOG_UC("[AnisetteKit - UC] Step 4: Calling ADIProvisioningStart (0x%llx) [spim_len=%u]...\n",
-           (unsigned long long)prov_start_ptr, spim_len);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    NativeOTPStageScope operation_stage(&trace, NativeOTPStage::NativeStartFailed);
     int32_t res = run_vm_procedure(vm, prov_start_ptr, {dsid, spim_vm, (uint64_t)spim_len, cpim_ptr, cpim_len_ptr, session_ptr});
-    LOG_UC("[AnisetteKit - UC] Step 4 result: %d\n", res);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
 
     if (res != 0) {
         rmdir(uuid_prov_dir.c_str());
@@ -931,6 +1012,7 @@ int32_t start_provision_uc(
         return res;
     }
 
+    operation_stage.finish(NativeOTPStage::NativeStartOK);
     uint64_t final_cpim_addr = 0;
     uint32_t final_cpim_len = 0;
     uint32_t session = 0;
@@ -939,8 +1021,7 @@ int32_t start_provision_uc(
     uc_mem_read(vm->uc, cpim_len_ptr, &final_cpim_len, 4);
     uc_mem_read(vm->uc, session_ptr, &session, 4);
 
-    LOG_UC("[AnisetteKit - UC] ADIProvisioningStart OK: cpim_addr=0x%llx, cpim_len=%u, session=%u\n",
-           (unsigned long long)final_cpim_addr, final_cpim_len, session);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
     fflush(stdout);
 
     std::vector<uint8_t> cpim_data(final_cpim_len);
@@ -954,6 +1035,8 @@ int32_t start_provision_uc(
     ss << "{\"cpim_base64\":\"" << cpim_b64 << "\",\"session\":" << session << "}";
     *out_json = strdup(ss.str().c_str());
 
+    trace.add(NativeOTPStage::NativeOutputUnchecked);
+    if (!*out_json) trace.add(NativeOTPStage::ResponseAllocationFailed);
     return ANISETTE_OK;
 }
 
@@ -973,11 +1056,14 @@ int32_t end_provision_uc(
         return ANISETTE_ERR_INVALID_ARGUMENT;
     }
 
+    *out_json = nullptr;
+    NativeOTPTrace trace(out_json);
+    trace.add(NativeOTPStage::ArgumentsOK);
     std::lock_guard<std::mutex> lock(g_vm_mutex);
 
     EmulatorVM *vm = nullptr;
     std::string uuid_prov_dir, err;
-    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err)) {
+    if (!setup_vm_and_adi(vm, lib_dir, provisioning_dir, identifier, uuid_prov_dir, err, false, &trace)) {
         std::stringstream ss;
         ss << "{\"error\":\"" << err << "\"}";
         *out_json = strdup(ss.str().c_str());
@@ -987,16 +1073,18 @@ int32_t end_provision_uc(
     uint64_t prov_end_ptr = get_vm_symbol_address(vm, kADISymbols.provisioning_end);
     if (!prov_end_ptr) {
         *out_json = strdup("{\"error\":\"Symbol ADIProvisioningEnd missing\"}");
+        trace.add(NativeOTPStage::NativeSymbolFailed);
         return ANISETTE_ERR_SYMBOL_MISSING;
     }
 
+    trace.add(NativeOTPStage::NativeSymbolOK);
     uint64_t ptm_vm = vm->write_bytes(ptm, ptm_len);
     uint64_t tk_vm  = vm->write_bytes(tk, tk_len);
 
-    LOG_UC("[AnisetteKit - UC] Step 4: Calling ADIProvisioningEnd (0x%llx) [session=%u, ptm_len=%u, tk_len=%u]...\n",
-           (unsigned long long)prov_end_ptr, session, ptm_len, tk_len);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    NativeOTPStageScope operation_stage(&trace, NativeOTPStage::NativeEndFailed);
     int32_t res = run_vm_procedure(vm, prov_end_ptr, {(uint64_t)session, ptm_vm, (uint64_t)ptm_len, tk_vm, (uint64_t)tk_len});
-    LOG_UC("[AnisetteKit - UC] Step 4 result: %d\n", res);
+    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
 
     if (res != 0) {
         std::stringstream ss;
@@ -1006,6 +1094,7 @@ int32_t end_provision_uc(
         return res;
     }
 
+    operation_stage.finish(NativeOTPStage::NativeEndOK);
     std::string adi_pb_path = uuid_prov_dir + "/" + kADISymbols.adi_pb_filename;
     FILE* f = fopen(adi_pb_path.c_str(), "rb");
     if (!f) {
@@ -1027,6 +1116,8 @@ int32_t end_provision_uc(
     ss << "{\"adi_pb_base64\":\"" << adi_pb_b64 << "\"}";
     *out_json = strdup(ss.str().c_str());
 
+    trace.add(NativeOTPStage::NativeOutputUnchecked);
+    if (!*out_json) trace.add(NativeOTPStage::ResponseAllocationFailed);
     return ANISETTE_OK;
 }
 

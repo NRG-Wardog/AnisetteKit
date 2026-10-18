@@ -62,6 +62,8 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         provider: (any AnisetteDataProvider)? = nil,
         libraryDirectoryResolver: LibraryDirectoryResolver? = nil
     ) throws {
+        let diagnosticSpan = LoginDiagnosticTrace.current?.begin(.clientInitialization)
+        do {
         self.provisioningDir = provisioningDir
         self.clientInfo = clientInfo
         self.userAgent = userAgent
@@ -83,6 +85,7 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
                     reason: "A libraryDirectoryResolver is required for \(type(of: resolvedProvider))."
                 )
             }
+            let librarySpan = LoginDiagnosticTrace.current?.begin(.libraryValidation)
             let resolvedDir = try resolver()
             guard Self.validateLibrariesExist(at: resolvedDir, requiredLibraries: requiredLibraries) else {
                 let bulletedLibs = requiredLibraries.map { "  • \($0)" }.joined(separator: "\n")
@@ -93,9 +96,16 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
                     """
                 )
             }
+            librarySpan?.finish(.succeeded)
             self.libDir = resolvedDir
         } else {
+            LoginDiagnosticTrace.current?.skip(.libraryValidation, reason: .notRequired)
             self.libDir = try? libraryDirectoryResolver?()
+        }
+        diagnosticSpan?.finish(.succeeded)
+        } catch {
+            diagnosticSpan?.finish(.failed, reason: .unavailable, error: error)
+            throw error
         }
     }
 
@@ -114,7 +124,9 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         storage: ProvisioningStorage = .disk,
         headers customHeaders: AnisetteRequestHeaders? = nil
     ) async throws -> (headers: [String: String], newBlob: Data?) {
-        try await fetchHeaders(identifier: identifier, storage: storage, customHeaders: customHeaders, provider: self.provider)
+        try await withLoginDiagnosticStage(.anisetteFetch) {
+            try await fetchHeaders(identifier: identifier, storage: storage, customHeaders: customHeaders, provider: self.provider)
+        }
     }
 }
 
@@ -137,22 +149,32 @@ extension AnisetteClient {
         customHeaders: AnisetteRequestHeaders?,
         provider: any AnisetteDataProvider
     ) async throws -> (headers: [String: String], newBlob: Data?) {
-        let (adiPbData, generatedBlob, cleanup) = try await resolveProvisioningBlob(
+        let (adiPbData, generatedBlob, cleanup) = try await withLoginDiagnosticStage(.provisioningBlob) {
+        try await resolveProvisioningBlob(
             identifier: identifier,
             storage: storage,
             headers: customHeaders
         ) {
             try await self.runProvisioningFlow(identifier: identifier, headers: customHeaders, provider: provider)
         }
-        defer { cleanup() }
+        }
+        defer {
+            let span = LoginDiagnosticTrace.current?.begin(.cleanup)
+            cleanup()
+            // Existing best-effort cleanup cannot report that removal succeeded.
+            span?.finish(.skipped, reason: .unavailable)
+        }
 
-        let response = try await provider.getAnisetteHeaders(
+        let response = try await withLoginDiagnosticStage(.nativeOTP) {
+        try await provider.getAnisetteHeaders(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
             identifier: identifier.uuidBytes,
             adiPb: [UInt8](adiPbData)
         )
+        }
 
+        let headerSpan = LoginDiagnosticTrace.current?.begin(.headerAssembly)
         let headers = AnisetteRequestHeaders.defaultHeaders
             .applyingOverrides(customHeaders)
             .with {
@@ -165,7 +187,9 @@ extension AnisetteClient {
                 if customHeaders?.userAgent == nil { $0.userAgent = self.userAgent }
             }
 
-        return (AnisetteHeadersDTO.toDictionary(from: headers), generatedBlob)
+        let result = (AnisetteHeadersDTO.toDictionary(from: headers), generatedBlob)
+        headerSpan?.finish(.succeeded)
+        return result
     }
 
     private func resolveProvisioningBlob(
@@ -194,22 +218,24 @@ extension AnisetteClient {
         case .disk:
             if !FileManager.default.fileExists(atPath: adiPbURL.path) {
                 verboseLog("[AnisetteKit] Native adi.pb missing. Starting automatic local provisioning...")
-                let newBlob = try await provisioner()
+                let newBlob = try await withLoginDiagnosticStage(.provisioning) { try await provisioner() }
                 try FileManager.default.createDirectory(at: uuidProvDir, withIntermediateDirectories: true, attributes: nil)
                 try newBlob.write(to: adiPbURL)
                 verboseLog("[AnisetteKit] Provisioning successful! Saved adi.pb locally.")
                 return (newBlob, newBlob, cleanup)
             } else {
+                LoginDiagnosticTrace.current?.skip(.provisioning, reason: .cached)
                 let data = try Data(contentsOf: adiPbURL)
                 return (data, nil, cleanup)
             }
 
         case .memory(let existing):
             if let provided = existing, !provided.isEmpty {
+                LoginDiagnosticTrace.current?.skip(.provisioning, reason: .cached)
                 return (provided, nil, cleanup)
             } else {
                 verboseLog("[AnisetteKit] Native adi.pb missing in-memory. Starting automatic local provisioning in-memory...")
-                let newBlob = try await provisioner()
+                let newBlob = try await withLoginDiagnosticStage(.provisioning) { try await provisioner() }
                 return (newBlob, newBlob, cleanup)
             }
         }
@@ -237,7 +263,9 @@ extension AnisetteClient {
         let lookupURL = self.lookupURL
         let lookupReq = createRequest(url: lookupURL, identifier: identifier, httpMethod: "GET", routingInfo: nil as String?, headers: customHeaders)
 
-        let (lookupData, lookupResp) = try await sendRequest(lookupReq, step: "Lookup", endpointName: "Apple lookup")
+        let (lookupData, lookupResp) = try await withLoginDiagnosticStage(.appleLookup) {
+            try await sendRequest(lookupReq, step: "Lookup", endpointName: "Apple lookup")
+        }
         var activeRoutingInfo = extractRoutingInfo(from: lookupResp, data: lookupData) ?? customHeaders?.routingInfo
 
         guard let plist = try PropertyListSerialization.propertyList(from: lookupData, options: [], format: nil) as? [String: Any],
@@ -249,27 +277,30 @@ extension AnisetteClient {
             debugLog("[AnisetteKit] ERROR: Failed to parse provisioning URLs from lookup")
             throw AnisetteError.invalidResponse(reason: "Failed to parse provisioning URLs from lookup")
         }
-        verboseLog("[AnisetteKit] Got start URL: \(startURLString)")
 
         verboseLog("[AnisetteKit] Fetching SPIM from Apple...")
-        let (spim, spimRinfo) = try await fetchSpim(startURL: startURL, identifier: identifier, routingInfo: activeRoutingInfo, headers: customHeaders)
+        let (spim, spimRinfo) = try await withLoginDiagnosticStage(.appleSPIM) {
+            try await fetchSpim(startURL: startURL, identifier: identifier, routingInfo: activeRoutingInfo, headers: customHeaders)
+        }
         if let spimRinfo = spimRinfo { activeRoutingInfo = spimRinfo }
-        verboseLog("[AnisetteKit] Got SPIM (\(spim.count) bytes). Running local start_provision...")
 
-        let provResult = try await provider.startProvision(
+        let provResult = try await withLoginDiagnosticStage(.nativeStart) {
+        try await provider.startProvision(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
             identifier: identifier.uuidBytes,
             spim: [UInt8](spim)
         )
-        verboseLog("[AnisetteKit] start_provision OK — session=\(provResult.session), cpim=\(provResult.cpim.count) bytes")
+        }
 
         verboseLog("[AnisetteKit] Sending CPIM to Apple finish provisioning...")
-        let (ptm, tk, ptmRinfo) = try await fetchPtmTk(endURL: endURL, cpim: provResult.cpim, identifier: identifier, routingInfo: activeRoutingInfo, headers: customHeaders)
+        let (ptm, tk, ptmRinfo) = try await withLoginDiagnosticStage(.appleFinish) {
+            try await fetchPtmTk(endURL: endURL, cpim: provResult.cpim, identifier: identifier, routingInfo: activeRoutingInfo, headers: customHeaders)
+        }
         if let ptmRinfo = ptmRinfo { activeRoutingInfo = ptmRinfo }
-        verboseLog("[AnisetteKit] Got PTM (\(ptm.count) bytes) and TK (\(tk.count) bytes). Running local end_provision...")
 
-        let adiPb = try await provider.endProvision(
+        let adiPb = try await withLoginDiagnosticStage(.nativeEnd) {
+        try await provider.endProvision(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
             identifier: identifier.uuidBytes,
@@ -277,7 +308,7 @@ extension AnisetteClient {
             ptm: [UInt8](ptm),
             tk: [UInt8](tk)
         )
-        verboseLog("[AnisetteKit] end_provision OK — adi.pb size=\(adiPb.count) bytes")
+        }
 
         if let finalRinfo = activeRoutingInfo {
             setCachedRoutingInfo(finalRinfo, for: identifier)
@@ -315,7 +346,6 @@ extension AnisetteClient {
     private func sendRequest(_ req: URLRequest, step: String, endpointName: String) async throws -> (data: Data, response: URLResponse) {
         let (data, resp) = try await URLSession.shared.data(for: req)
         let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
-        verboseLog("[AnisetteKit] \(step) HTTP status: \(statusCode)")
         guard statusCode == 200 else {
             throw AnisetteError.httpError(statusCode: statusCode, message: "\(endpointName) endpoint returned HTTP \(statusCode)")
         }
@@ -361,10 +391,8 @@ extension AnisetteClient {
               let response = plist["Response"] as? [String: Any],
               let spimString = response["spim"] as? String,
               let spimData = Data(base64Encoded: spimString) else {
-            debugLog("[AnisetteKit] fetchSpim ERROR: plist keys: \((try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any])?.keys.joined(separator: ", ") ?? "?")")
             throw AnisetteError.invalidResponse(reason: "Failed to parse spim from Apple response")
         }
-        verboseLog("[AnisetteKit] fetchSpim got spim (\(spimData.count) bytes)")
         return (spimData, discoveredRinfo)
     }
 
@@ -382,10 +410,8 @@ extension AnisetteClient {
               let tkString = response["tk"] as? String,
               let ptm = Data(base64Encoded: ptmString),
               let tk = Data(base64Encoded: tkString) else {
-            debugLog("[AnisetteKit] fetchPtmTk ERROR: plist keys: \((try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any])?.keys.joined(separator: ", ") ?? "?")")
             throw AnisetteError.invalidResponse(reason: "Failed to parse ptm/tk from Apple response")
         }
-        verboseLog("[AnisetteKit] fetchPtmTk got ptm (\(ptm.count) bytes), tk (\(tk.count) bytes)")
         return (ptm, tk, discoveredRinfo)
     }
 }
