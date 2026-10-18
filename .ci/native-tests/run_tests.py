@@ -231,6 +231,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             (build / 'Loader').mkdir()
             (build / 'unicorn').mkdir()
             (build / 'Loader/elf_loader_emulator.h').write_text(source('Native/Loader/elf_loader_emulator.h'))
+            shutil.copyfile(ROOT / 'Native/Loader/elf_metadata_bounds.h', build / 'Loader/elf_metadata_bounds.h')
             shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', build / 'Loader/vm_initialization_diagnostics.h')
             shutil.copyfile(ROOT / 'Native/Loader/android_tls_runtime.h', build / 'android_tls_runtime.h')
             for path in ('Native/anisette_base.h', 'Native/include/anisette_core.h', 'Native/anisette_base.cpp'):

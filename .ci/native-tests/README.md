@@ -1,5 +1,33 @@
 # Maintained Anisette native tests
 
+Defensive ELF metadata checks: run
+`python3 .ci/native-tests/test_elf_metadata_bounds.py --output RESULTS`.
+This compiles the production metadata helper and runs 713 ordinary host-only
+checks in normal, optimized and fail-fast ASan/UBSan modes. The sample contains
+only metadata and data objects, with no executable segment, guest instructions,
+constructor pointers, proprietary input or Unicorn engine. It tests valid
+metadata, count/name/index limits, checked arithmetic, allocator-capacity
+predicates and boundary rejection. `--disable-leak-sanitizer` is an explicit
+reported override only for executors where LSan cannot run, such as ptrace;
+ASan and UBSan still run and any stderr or nonzero exit fails the driver.
+
+The bounded loader requires checked DT_HASH/DT_SYMENT metadata. GNU-hash-only
+objects, recognized DT_REL/DT_RELSZ tags with nonzero values, unsupported nonzero
+types within the recognized RELA/JMPREL tables, overlapping PT_LOAD ranges and
+unsupported reserved symbol definitions fail closed. RELA requires its address,
+size and entry-size tags together; JMPREL requires its address, size and format
+tags together. Complete zero-sized groups are valid and perform no table reads;
+missing companions or an invalid entry format fail even when size is zero.
+The unit matrix covers every presence combination for both groups at zero and
+nonzero sizes. Valid named imports and zero-valued/absolute definitions remain
+supported.
+
+This narrow parser does not interpret or validate RELR (DT_RELR/DT_RELRSZ/
+DT_RELRENT), Android packed DT_ANDROID_REL/DT_ANDROID_RELA and related size tags,
+or other unrecognized dynamic relocation encodings. Such tags remain ignored;
+this is not universal rejection of every unsupported relocation format.
+These checks establish host parser behavior, not iOS TCI or device login.
+
 Run `python3 .ci/native-tests/run_tests.py` with Python 3 and a C++17 compiler.
 The suite compiles the maintained native wrapper and selected actual loader
 functions against synthetic I/O/Unicorn test doubles. It reads production Swift

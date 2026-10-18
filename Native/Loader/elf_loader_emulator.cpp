@@ -165,7 +165,7 @@ static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data);
 EmulatorVM::EmulatorVM(bool checked)
     : uc(nullptr),
       heap(kHeapAddress, kHeapSize, 64),
-      library_alloc(0x10000000, 0x30000000, 0x10000),
+      library_alloc(kLibraryAddress, kLibrarySize, 0x10000),
       next_import_address(kImportAddress),
       next_guest_fd(10)
 {
@@ -245,11 +245,18 @@ uint64_t EmulatorVM::register_import(const std::string &name) {
         return it->second;
     }
 
-    uint64_t stub_addr = next_import_address;
+    if (next_import_address < kImportAddress ||
+        !elf_metadata_bounds::range(kImportSize, next_import_address - kImportAddress, 8)) {
+        initialization_failed = true;
+        return 0;
+    }
+    const uint64_t stub_addr = next_import_address;
+    const uint32_t ret_insn = 0xD65F03C0;
+    if (uc_mem_write(uc, stub_addr, &ret_insn, sizeof(ret_insn)) != UC_ERR_OK) {
+        initialization_failed = true;
+        return 0;
+    }
     next_import_address += 8;
-
-    uint32_t ret_insn = 0xD65F03C0;
-    uc_mem_write(uc, stub_addr, &ret_insn, sizeof(ret_insn));
 
     imported_symbols[name] = stub_addr;
     import_stubs[stub_addr] = name;
@@ -1080,27 +1087,24 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
 }
 
 static uint64_t vm_resolve_symbol(EmulatorVM *vm, const EmulatorVM::LibraryInfo &current_lib, uint32_t sym_idx) {
-    if (!current_lib.symtab || !current_lib.strtab) return 0;
-    Elf64_Sym sym;
-    if (uc_mem_read(vm->uc, current_lib.symtab + sym_idx * sizeof(Elf64_Sym), &sym, sizeof(sym)) != UC_ERR_OK) {
+    Elf64_Sym sym{};
+    std::string sym_name;
+    if (!elf_metadata_bounds::symbol(current_lib.metadata, sym_idx, sym) ||
+        !elf_metadata_bounds::name(current_lib.metadata, sym.st_name, sym_name)) {
+        vm->initialization_failed = true;
         return 0;
     }
-
-    std::string sym_name;
-    if (sym.st_name < current_lib.strsz) {
-        std::vector<char> name_buf(256, 0);
-        uc_mem_read(vm->uc, current_lib.strtab + sym.st_name, name_buf.data(), 255);
-        sym_name = name_buf.data();
+    if (sym.st_shndx != elf_metadata_bounds::undefined_section) {
+        uint64_t address = 0;
+        if (!elf_metadata_bounds::definition_address(current_lib.metadata, current_lib.base_address, sym, address)) {
+            vm->initialization_failed = true;
+            return 0;
+        }
+        return address;
     }
-
-    if (sym_name.empty()) {
-        if (sym.st_value != 0) return current_lib.base_address + (sym.st_value - current_lib.min_vaddr);
-        return current_lib.base_address;
-    }
-
-    if (sym.st_value != 0 && sym.st_shndx != 0) {
-        return current_lib.base_address + (sym.st_value - current_lib.min_vaddr);
-    }
+    // STN_UNDEF / an unnamed undefined symbol has the ELF value zero. A
+    // defined symbol at value zero is handled above, without a sentinel test.
+    if (sym_name.empty()) return 0;
 
     auto self_it = current_lib.symbols.find(sym_name);
     if (self_it != current_lib.symbols.end()) return self_it->second;
@@ -1144,9 +1148,16 @@ static uint64_t vm_resolve_symbol(EmulatorVM *vm, const EmulatorVM::LibraryInfo 
     if (is_data) {
         auto it = vm->imported_symbols.find(sym_name);
         if (it != vm->imported_symbols.end()) return it->second;
+        if (!vm->heap.can_allocate(256)) {
+            vm->initialization_failed = true;
+            return 0;
+        }
         uint64_t dummy = vm->heap.alloc(256);
         std::vector<uint8_t> zeros(256, 0);
-        uc_mem_write(vm->uc, dummy, zeros.data(), 256);
+        if (uc_mem_write(vm->uc, dummy, zeros.data(), 256) != UC_ERR_OK) {
+            vm->initialization_failed = true;
+            return 0;
+        }
         vm->imported_symbols[sym_name] = dummy;
         return dummy;
     }
@@ -1154,189 +1165,135 @@ static uint64_t vm_resolve_symbol(EmulatorVM *vm, const EmulatorVM::LibraryInfo 
     return vm->register_import(sym_name);
 }
 
-static void apply_vm_relocations(EmulatorVM *vm, EmulatorVM::LibraryInfo &lib) {
-    auto apply_table = [&](uint64_t rela_ptr, size_t sz, const char *label) {
-        if (!rela_ptr || !sz) return;
-        size_t count = sz / sizeof(Elf64_Rela);
+static bool apply_vm_relocations(EmulatorVM *vm, EmulatorVM::LibraryInfo &lib) {
+    auto apply_table = [&](const std::vector<Elf64_Rela> &table, const char *label) {
         size_t applied = 0;
-        Elf64_Rela r;
-        for (size_t offset = 0; offset < sz; offset += sizeof(r)) {
-            if (uc_mem_read(vm->uc, rela_ptr + offset, &r, sizeof(r)) != UC_ERR_OK) break;
-
-            uint32_t type = (uint32_t)ELF64_R_TYPE(r.r_info);
-            uint32_t sym_idx = (uint32_t)ELF64_R_SYM(r.r_info);
-            uint64_t target_addr = lib.base_address + (r.r_offset - lib.min_vaddr);
-
+        for (const auto &r : table) {
+            const uint32_t type = static_cast<uint32_t>(ELF64_R_TYPE(r.r_info));
+            const uint32_t sym_idx = static_cast<uint32_t>(ELF64_R_SYM(r.r_info));
+            if (sym_idx >= lib.metadata.symbol_count) return false;
+            if (type == 0) continue; // R_AARCH64_NONE
+            uint64_t target_addr = 0, final_val = 0;
+            if (!elf_metadata_bounds::guest_address(lib.metadata, lib.base_address, r.r_offset,
+                                                    sizeof(final_val), target_addr)) return false;
             if (type == R_AARCH64_RELATIVE) {
-                uint64_t final_val = lib.base_address + (r.r_addend - lib.min_vaddr);
-                uc_mem_write(vm->uc, target_addr, &final_val, sizeof(final_val));
-                applied++;
+                if (!elf_metadata_bounds::relative_address(lib.metadata, lib.base_address, r.r_addend, final_val))
+                    return false;
             } else if (type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_GLOB_DAT || type == R_AARCH64_ABS64) {
-                uint64_t sym_addr = vm_resolve_symbol(vm, lib, sym_idx);
-                if (sym_addr != 0) {
-                    uint64_t final_val = sym_addr + r.r_addend;
-                    uc_mem_write(vm->uc, target_addr, &final_val, sizeof(final_val));
-                    applied++;
-                }
+                const uint64_t sym_addr = vm_resolve_symbol(vm, lib, sym_idx);
+                if (vm->initialization_failed || !elf_metadata_bounds::signed_add(sym_addr, r.r_addend, final_val))
+                    return false;
+            } else {
+                return false;
             }
+            if (uc_mem_write(vm->uc, target_addr, &final_val, sizeof(final_val)) != UC_ERR_OK) return false;
+            ++applied;
         }
         LOG_UC("[Emulator] Applied %zu / %zu relocations for %s in '%s'\n",
-               applied, count, label, lib.name.c_str());
+               applied, table.size(), label, lib.name.c_str());
+        return true;
     };
-
-    apply_table(lib.rela, lib.relasz, "RELA");
-    apply_table(lib.jmprel, lib.pltrelsz, "PLT/JMPREL");
+    return apply_table(lib.metadata.rela, "RELA") && apply_table(lib.metadata.jmprel, "PLT/JMPREL");
 }
 
 bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std::string &so_name) {
-    LOG_UC("[Emulator] Loading ELF library '%s' from '%s'...\n", so_name.c_str(), file_path.c_str());
-    FILE *f = fopen(file_path.c_str(), "rb");
-    if (!f) {
-        LOG_UC("[Emulator] Failed to open ELF file: %s\n", file_path.c_str());
+    if (!vm || !vm->uc || vm->initialization_failed) return false;
+    auto fail = [&](const char *reason) {
+        LOG_UC("[Emulator] Failed loading '%s': %s\n", so_name.c_str(), reason);
+        vm->initialization_failed = true;
         return false;
-    }
+    };
+    try {
+        LOG_UC("[Emulator] Loading ELF library '%s' from '%s'...\n", so_name.c_str(), file_path.c_str());
+        std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(file_path.c_str(), "rb"), fclose);
+        if (!file) return fail("file open failed");
+        if (fseek(file.get(), 0, SEEK_END) != 0) return fail("file seek failed");
+        const long length = ftell(file.get());
+        if (length < 0 || static_cast<uint64_t>(length) > SIZE_MAX ||
+            fseek(file.get(), 0, SEEK_SET) != 0) return fail("invalid file size");
+        const size_t file_size = static_cast<size_t>(length);
+        std::vector<uint8_t> buffer(file_size);
+        if (fread(buffer.data(), 1, file_size, file.get()) != file_size) return fail("file read failed");
+        file.reset();
 
-    std::unique_ptr<FILE, int (*)(FILE *)> file_owner(f, fclose);
-    fseek(f, 0, SEEK_END);
-    size_t file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    std::vector<uint8_t> buffer(file_size);
-    if (fread(buffer.data(), 1, file_size, f) != file_size) {
-        file_owner.reset();
-        return false;
-    }
-    file_owner.reset();
-
-    if (file_size < sizeof(Elf64_Ehdr)) return false;
-    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)buffer.data();
-
-    if (memcmp(ehdr->e_ident, "\x7f\x45\x4c\x46\x02\x01\x01", 7) != 0) {
-        LOG_UC("[Emulator] Invalid ELF magic or not 64-bit ELF: %s\n", so_name.c_str());
-        return false;
-    }
-
-    uint64_t min_vaddr = UINT64_MAX;
-    uint64_t max_vaddr = 0;
-    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(buffer.data() + ehdr->e_phoff);
-
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrs[i].p_type == PT_LOAD) {
-            uint64_t seg_start = phdrs[i].p_vaddr & ~0xFFFFULL;
-            uint64_t seg_end   = (phdrs[i].p_vaddr + phdrs[i].p_memsz + 0xFFFFULL) & ~0xFFFFULL;
-            if (seg_start < min_vaddr) min_vaddr = seg_start;
-            if (seg_end > max_vaddr) max_vaddr = seg_end;
+        EmulatorVM::LibraryInfo lib{};
+        const char *error = nullptr;
+        if (!elf_metadata_bounds::parse(buffer.data(), buffer.size(), lib.metadata, error)) return fail(error);
+        lib.name = so_name;
+        lib.min_vaddr = lib.metadata.min_vaddr;
+        lib.max_vaddr = lib.metadata.max_vaddr;
+        const uint64_t total_span = lib.max_vaddr - lib.min_vaddr;
+        // Preserve PageAllocator's ABI/behavior. Reject an exhausted arena
+        // before invoking its abort-on-exhaustion API.
+        if (!vm->library_alloc.can_allocate(total_span)) return fail("library arena exhausted");
+        lib.base_address = vm->library_alloc.alloc(total_span);
+        auto translate = [&](uint64_t value, uint64_t bytes, uint64_t &address) {
+            return elf_metadata_bounds::guest_address(lib.metadata, lib.base_address, value, bytes, address);
+        };
+        if (!translate(lib.metadata.dynamic, sizeof(Elf64_Dyn), lib.dynamic_address) ||
+            !translate(lib.metadata.symtab, lib.metadata.symbol_count * sizeof(Elf64_Sym), lib.symtab) ||
+            !translate(lib.metadata.strtab, lib.metadata.strsz, lib.strtab)) return fail("invalid metadata address");
+        lib.strsz = static_cast<size_t>(lib.metadata.strsz);
+        lib.relasz = lib.metadata.rela.size() * sizeof(Elf64_Rela);
+        lib.pltrelsz = lib.metadata.jmprel.size() * sizeof(Elf64_Rela);
+        lib.init_arraysz = static_cast<size_t>(lib.metadata.init_arraysz);
+        if ((lib.relasz && !translate(lib.metadata.rela_address, lib.relasz, lib.rela)) ||
+            (lib.pltrelsz && !translate(lib.metadata.jmprel_address, lib.pltrelsz, lib.jmprel)) ||
+            (lib.metadata.init && !translate(lib.metadata.init, 4, lib.init_func)) ||
+            (lib.init_arraysz && !translate(lib.metadata.init_array, lib.init_arraysz, lib.init_array)))
+            return fail("invalid table address");
+        for (size_t index = 0; index < lib.metadata.symbol_count; ++index) {
+            Elf64_Sym sym{};
+            std::string symbol_name;
+            if (!elf_metadata_bounds::symbol(lib.metadata, index, sym) ||
+                !elf_metadata_bounds::name(lib.metadata, sym.st_name, symbol_name)) return fail("invalid symbol");
+            if (symbol_name.empty() || !elf_metadata_bounds::ordinary_definition(sym)) continue;
+            uint64_t address = 0;
+            if (!elf_metadata_bounds::definition_address(lib.metadata, lib.base_address, sym, address))
+                return fail("invalid export address");
+            lib.symbols[symbol_name] = address;
         }
-    }
-
-    if (min_vaddr >= max_vaddr) return false;
-    uint64_t total_span = max_vaddr - min_vaddr;
-
-    uint64_t base_address = vm->library_alloc.alloc(total_span);
-    LOG_UC("[Emulator] Mapped library '%s' span 0x%llx at base address: 0x%llx\n",
-           so_name.c_str(), (unsigned long long)total_span, (unsigned long long)base_address);
-
-    uc_err err = uc_mem_map(vm->uc, base_address, total_span, UC_PROT_ALL);
-    if (err != UC_ERR_OK && err != UC_ERR_MAP) {
-        LOG_UC("[Emulator] uc_mem_map failed for library span: %u (%s)\n", err, uc_strerror(err));
-        return false;
-    }
-
-    EmulatorVM::LibraryInfo lib;
-    lib.name = so_name;
-    lib.base_address = base_address;
-    lib.min_vaddr = min_vaddr;
-    lib.max_vaddr = max_vaddr;
-    lib.dynamic_address = 0;
-    lib.symtab = 0;
-    lib.strtab = 0;
-    lib.strsz = 0;
-    lib.rel = 0;
-    lib.relsz = 0;
-    lib.rela = 0;
-    lib.relasz = 0;
-    lib.jmprel = 0;
-    lib.pltrelsz = 0;
-    lib.init_func = 0;
-    lib.init_array = 0;
-    lib.init_arraysz = 0;
-
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrs[i].p_type == PT_LOAD) {
-            uint64_t dest = base_address + (phdrs[i].p_vaddr - min_vaddr);
-            if (phdrs[i].p_filesz > 0) {
-                uc_mem_write(vm->uc, dest, buffer.data() + phdrs[i].p_offset, phdrs[i].p_filesz);
-            }
-            if (phdrs[i].p_memsz > phdrs[i].p_filesz) {
-                uint64_t bss_size = phdrs[i].p_memsz - phdrs[i].p_filesz;
-                std::vector<uint8_t> bss_zeros(bss_size, 0);
-                uc_mem_write(vm->uc, dest + phdrs[i].p_filesz, bss_zeros.data(), bss_size);
-            }
-        } else if (phdrs[i].p_type == PT_DYNAMIC) {
-            lib.dynamic_address = base_address + (phdrs[i].p_vaddr - min_vaddr);
-        }
-    }
-
-    if (lib.dynamic_address) {
-        size_t dyn_offset = 0;
-        while (true) {
-            Elf64_Dyn dyn;
-            if (uc_mem_read(vm->uc, lib.dynamic_address + dyn_offset, &dyn, sizeof(dyn)) != UC_ERR_OK) break;
-            dyn_offset += sizeof(dyn);
-            if (dyn.d_tag == DT_NULL) break;
-
-            uint64_t val = (uint64_t)dyn.d_un.d_val;
-            uint64_t ptr = (val >= min_vaddr) ? (base_address + (val - min_vaddr)) : (base_address + val);
-
-            switch (dyn.d_tag) {
-                case DT_SYMTAB: lib.symtab = ptr; break;
-                case DT_STRTAB: lib.strtab = ptr; break;
-                case DT_STRSZ:  lib.strsz = (size_t)val; break;
-                case DT_REL:    lib.rel = ptr; break;
-                case DT_RELSZ:  lib.relsz = (size_t)val; break;
-                case DT_RELA:   lib.rela = ptr; break;
-                case DT_RELASZ: lib.relasz = (size_t)val; break;
-                case DT_JMPREL: lib.jmprel = ptr; break;
-                case DT_PLTRELSZ: lib.pltrelsz = (size_t)val; break;
-                case DT_INIT:   lib.init_func = ptr; break;
-                case DT_INIT_ARRAY: lib.init_array = ptr; break;
-                case DT_INIT_ARRAYSZ: lib.init_arraysz = (size_t)val; break;
-                default: break;
+        // No metadata-dependent file access remains unchecked. Keep immutable
+        // symbol/string/relocation snapshots so a guest write cannot change
+        // parser inputs while relocations are being applied.
+        const uc_err map_status = uc_mem_map(vm->uc, lib.base_address, total_span, UC_PROT_ALL);
+        if (map_status != UC_ERR_OK) return fail("library mapping failed");
+        for (const auto &segment : lib.metadata.loads) {
+            uint64_t destination = 0;
+            if (!translate(segment.p_vaddr, segment.p_memsz, destination)) return fail("invalid load destination");
+            if (segment.p_filesz && uc_mem_write(vm->uc, destination,
+                buffer.data() + static_cast<size_t>(segment.p_offset), static_cast<size_t>(segment.p_filesz)) != UC_ERR_OK)
+                return fail("segment write failed");
+            uint64_t bss_address = 0;
+            if (!elf_metadata_bounds::add(destination, segment.p_filesz, bss_address)) return fail("BSS address overflow");
+            uint64_t remaining = segment.p_memsz - segment.p_filesz;
+            const uint8_t zeros[4096] = {};
+            while (remaining) {
+                const size_t count = remaining < sizeof(zeros) ? static_cast<size_t>(remaining) : sizeof(zeros);
+                if (uc_mem_write(vm->uc, bss_address, zeros, count) != UC_ERR_OK) return fail("BSS write failed");
+                bss_address += count;
+                remaining -= count;
             }
         }
+        vm->loaded_libraries.push_back(std::move(lib));
+        return true;
+    } catch (const std::exception &) {
+        return fail("metadata allocation or read failed");
     }
-
-    if (lib.symtab && lib.strtab && lib.strsz) {
-        size_t sym_offset = 0;
-        while (true) {
-            Elf64_Sym sym;
-            if (uc_mem_read(vm->uc, lib.symtab + sym_offset, &sym, sizeof(sym)) != UC_ERR_OK) break;
-            sym_offset += sizeof(sym);
-            if (sym.st_name >= lib.strsz) continue;
-
-            std::vector<char> name_buf(256, 0);
-            uc_mem_read(vm->uc, lib.strtab + sym.st_name, name_buf.data(), 255);
-            std::string sym_name = name_buf.data();
-            if (sym_name.empty()) {
-                if (sym_offset > sizeof(sym) * 4 && sym.st_value == 0) break;
-                continue;
-            }
-
-            if (sym.st_value != 0) {
-                uint64_t sym_addr = base_address + (sym.st_value - min_vaddr);
-                lib.symbols[sym_name] = sym_addr;
-            }
-        }
-    }
-
-    vm->loaded_libraries.push_back(lib);
-    return true;
 }
 
 void relocate_all_vm_libraries(EmulatorVM *vm) {
+    if (!vm || !vm->uc || vm->initialization_failed) return;
     LOG_UC("[Emulator] Relocating all %zu loaded libraries...\n", vm->loaded_libraries.size());
-    for (auto &lib : vm->loaded_libraries) {
-        apply_vm_relocations(vm, lib);
+    try {
+        for (auto &lib : vm->loaded_libraries) {
+            if (!apply_vm_relocations(vm, lib)) {
+                vm->initialization_failed = true;
+                return;
+            }
+        }
+    } catch (const std::exception &) {
+        vm->initialization_failed = true;
     }
 }
 

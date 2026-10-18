@@ -28,10 +28,13 @@
 #include <unicorn/unicorn.h>
 #include "anisette_base.h"
 #include "vm_initialization_diagnostics.h"
+#include "elf_metadata_bounds.h"
 
 extern thread_local bool g_isolated_otp_logging_suppressed;
 #define LOG_UC(...) do { if (!g_isolated_otp_logging_suppressed) anisetteCoreLog(__VA_ARGS__); } while (0)
 
+static const uint64_t kLibraryAddress = 0x10000000;
+static const uint64_t kLibrarySize = 0x30000000;
 static const uint64_t kReturnAddress = 0xDEAD0000;
 static const uint64_t kHeapAddress   = 0x48000000;
 static const uint32_t kHeapSize      = 0x20000000;
@@ -64,12 +67,16 @@ public:
     PageAllocator(uint64_t base_addr, uint64_t total_size, uint64_t align_bytes = 16)
         : base(base_addr), size(total_size), offset(0), alignment(align_bytes) {}
 
+    bool can_allocate(uint64_t bytes) const {
+        return elf_metadata_bounds::allocation_fits(base, size, offset, alignment, bytes);
+    }
     uint64_t alloc(uint64_t bytes);
 };
 
 struct EmulatorVM {
     struct LibraryInfo {
         std::string name;
+        elf_metadata_bounds::Metadata metadata;
         uint64_t base_address;
         uint64_t min_vaddr;
         uint64_t max_vaddr;

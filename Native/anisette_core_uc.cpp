@@ -437,6 +437,10 @@ static bool setup_vm_and_adi(
         load_stage.finish(NativeOTPStage::LibraryLoadOK);
         NativeOTPStageScope library_stage(trace, NativeOTPStage::LibraryInitFailed);
         relocate_all_vm_libraries(vm);
+        if (vm->initialization_failed) {
+            out_err = "Failed to relocate libraries into VM";
+            return false;
+        }
         adiConsumptionPhase(ADIConsumptionDebug::Constructors);
         vm_initialization_diagnostics::ConstructorFailure constructor_failure;
         if (!run_library_constructors(vm, &constructor_failure)) {
