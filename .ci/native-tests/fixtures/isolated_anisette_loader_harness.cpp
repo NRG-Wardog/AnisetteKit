@@ -110,12 +110,15 @@ int main() {
     {std::ofstream f(canonical);f<<"DO-NOT-MODIFY";}
     assert(chmod(canonical.c_str(),0600)==0);
     {
-        // Actual library loader: allocation after fopen must still close FILE*.
+        // The defensive loader contains allocation failure, poisons the VM,
+        // and still closes FILE* before returning false.
         EmulatorVM exception_vm(true);
-        fail_library_buffer=true;bool caught=false;
-        try { load_library_to_vm(&exception_vm,canonical,"synthetic"); }
-        catch(const std::bad_alloc&){caught=true;}
-        assert(caught && last_library_fd>=0 && fcntl(last_library_fd,F_GETFD)==-1 && errno==EBADF);
+        fail_library_buffer=true;bool caught=false,loaded=true;
+        try { loaded=load_library_to_vm(&exception_vm,canonical,"synthetic"); }
+        catch(...){caught=true;}
+        assert(!caught && !loaded && exception_vm.initialization_failed);
+        assert(exception_vm.loaded_libraries.empty() && !fail_next_allocation);
+        assert(last_library_fd>=0 && fcntl(last_library_fd,F_GETFD)==-1 && errno==EBADF);
         // Actual open hook: failed fd_map ownership transfer must close host FD.
         auto pathname=exception_vm.write_string(canonical.c_str());
         reg(exception_vm,UC_ARM64_REG_X0,pathname);reg(exception_vm,UC_ARM64_REG_X1,0);reg(exception_vm,UC_ARM64_REG_X2,0);
