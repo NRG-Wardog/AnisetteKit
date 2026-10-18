@@ -23,7 +23,7 @@ def main():
  if library is None or not (uc/'include/unicorn/unicorn.h').is_file():p.error('Trusted Unicorn headers/shared library unavailable')
  if a.disable_leak_sanitizer and not a.sanitizers:p.error('Leak detector override requires --sanitizers')
  sources=[root/'Native/Loader/elf_loader_emulator.cpp',root/'.ci/native-tests/fixtures/android_tls_constructor.cpp']
- evidence=sources+[root/'Native/Loader/elf_loader_emulator.h',root/'Native/Loader/elf_metadata_bounds.h',root/'Native/Loader/android_tls_runtime.h']
+ evidence=sources+[root/'Native/Loader/cxx_allocation_runtime.h',root/'Native/Loader/elf_loader_emulator.h',root/'Native/Loader/elf_metadata_bounds.h',root/'Native/Loader/android_tls_runtime.h']
  if not all(x.is_file() for x in evidence):p.error('Candidate sources/fixture missing')
  compiler=os.environ.get('CXX','c++');environment=os.environ.copy()
  if a.disable_leak_sanitizer:environment['ASAN_OPTIONS']='detect_leaks=0'

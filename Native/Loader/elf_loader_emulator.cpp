@@ -9,6 +9,7 @@
 
 #include "elf_loader_emulator.h"
 #include "android_tls_runtime.h"
+#include "cxx_allocation_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -295,6 +296,18 @@ static void hook_malloc(EmulatorVM *vm) {
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &size);
     uint64_t ptr = vm->heap.alloc(size + 16);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ptr);
+}
+
+// Throwing C++ new cannot use the unknown-import zero-return fallback.
+// On allocation/register failure stop before the guest can dereference null.
+static void hook_cxx_new(EmulatorVM *vm) {
+    uint64_t size = 0, pointer = 0;
+    if (uc_reg_read(vm->uc, UC_ARM64_REG_X0, &size) != UC_ERR_OK ||
+        !cxx_allocation_runtime::allocate(vm->heap, size, pointer) ||
+        uc_reg_write(vm->uc, UC_ARM64_REG_X0, &pointer) != UC_ERR_OK) {
+        vm->initialization_failed = true;
+        uc_emu_stop(vm->uc);
+    }
 }
 
 static void hook_calloc(EmulatorVM *vm) {
@@ -1028,7 +1041,11 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
 
     const std::string &name = it->second;
 
-    if (name == "malloc") hook_malloc(vm);
+    const auto cxx_operation = cxx_allocation_runtime::classify(name);
+    if (cxx_operation == cxx_allocation_runtime::Operation::New) hook_cxx_new(vm);
+    // Matches this VM's existing free semantics: arena lifetime is the VM.
+    else if (cxx_operation == cxx_allocation_runtime::Operation::Delete) hook_free(vm);
+    else if (name == "malloc") hook_malloc(vm);
     else if (name == "calloc") hook_calloc(vm);
     else if (name == "realloc") hook_realloc(vm);
     else if (name == "free") hook_free(vm);
@@ -1415,7 +1432,7 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
     uint64_t pc = 0;
     const uc_err pc_status = uc_reg_read(vm->uc, UC_ARM64_REG_PC, &pc);
     if (err == UC_ERR_OK && pc_status != UC_ERR_OK) err = pc_status;
-    if (err != UC_ERR_OK || pc != kReturnAddress) {
+    if (vm->initialization_failed || err != UC_ERR_OK || pc != kReturnAddress) {
         if (failure) {
             failure->reason = vm->unsupported_interrupt ? Reason::UnsupportedInterrupt :
                 (err != UC_ERR_OK ? Reason::EngineError : Reason::UnexpectedReturn);
