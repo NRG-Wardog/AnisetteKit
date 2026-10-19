@@ -65,6 +65,7 @@ uc_err uc_emu_start(uc_engine *uc,uint64_t begin,uint64_t end,uint64_t timeout,s
     int32_t code=-45061;uc_reg_write(uc,UC_ARM64_REG_W0,&code);return execution_error;
 }
 const char *uc_strerror(uc_err) { return "synthetic"; }
+uc_err uc_emu_stop(uc_engine *) { return UC_ERR_OK; }
 static void hook_mem_invalid(){}
 static void hook_intr(){}
 static void import_callback_router(){}
@@ -120,12 +121,13 @@ int main() {
         assert(exception_vm.loaded_libraries.empty() && !fail_next_allocation);
         assert(last_library_fd>=0 && fcntl(last_library_fd,F_GETFD)==-1 && errno==EBADF);
         // Actual open hook: failed fd_map ownership transfer must close host FD.
-        auto pathname=exception_vm.write_string(canonical.c_str());
-        reg(exception_vm,UC_ARM64_REG_X0,pathname);reg(exception_vm,UC_ARM64_REG_X1,0);reg(exception_vm,UC_ARM64_REG_X2,0);
+        EmulatorVM open_vm(true);
+        auto pathname=open_vm.write_string(canonical.c_str());
+        reg(open_vm,UC_ARM64_REG_X0,pathname);reg(open_vm,UC_ARM64_REG_X1,0);reg(open_vm,UC_ARM64_REG_X2,0);
         fail_map_insertion=true;caught=false;
-        try { hook_open(&exception_vm); } catch(const std::bad_alloc&){caught=true;}
+        try { hook_open(&open_vm); } catch(const std::bad_alloc&){caught=true;}
         assert(caught && last_opened_fd>=0 && fcntl(last_opened_fd,F_GETFD)==-1 && errno==EBADF);
-        assert(exception_vm.fd_map.empty());
+        assert(open_vm.fd_map.empty());
     }
     const auto path=probe.write_string(canonical.c_str());
     for(uint64_t flags:{1ULL,2ULL,0x40ULL,0x200ULL,0x400ULL,0x410000ULL}) {

@@ -456,6 +456,9 @@ static std::mutex g_vm_mutex;
 static std::string g_current_prov_path = "";
 static std::string g_current_android_id = "";
 static bool g_libraries_initialized = false;
+// A constructor can fail before a VM exists; retain that failure as well.
+// Accessed only while g_vm_mutex is held.
+static bool g_vm_initialization_failed = false;
 
 static bool setup_vm_and_adi(
     EmulatorVM *&vm,
@@ -479,7 +482,7 @@ static bool setup_vm_and_adi(
         return false;
     }
 
-    if (g_shared_vm && g_shared_vm->initialization_failed) {
+    if (g_vm_initialization_failed || (g_shared_vm && g_shared_vm->initialization_failed)) {
         out_err = "VM initialization previously failed; restart required";
         return false;
     }
@@ -487,6 +490,7 @@ static bool setup_vm_and_adi(
         NativeOTPStageScope init_stage(trace, NativeOTPStage::VMInitFailed);
         try { g_shared_vm = new EmulatorVM(); }
         catch (const std::exception &) {
+            g_vm_initialization_failed = true;
             out_err = "VM initialization failed";
             return false;
         }
@@ -672,10 +676,15 @@ static int32_t get_anisette_headers_uc_locked(
         return ANISETTE_ERR_SYMBOL_MISSING;
     }
 
-    uint64_t mid_ptr = vm->heap.alloc(8);
-    uint64_t mid_len_ptr = vm->heap.alloc(4);
-    uint64_t otp_ptr = vm->heap.alloc(8);
-    uint64_t otp_len_ptr = vm->heap.alloc(4);
+    uint64_t mid_ptr = vm->allocate_guest(8);
+    uint64_t mid_len_ptr = vm->allocate_guest(4);
+    uint64_t otp_ptr = vm->allocate_guest(8);
+    uint64_t otp_len_ptr = vm->allocate_guest(4);
+    if (!mid_ptr || !mid_len_ptr || !otp_ptr || !otp_len_ptr) {
+        trace.add(NativeOTPStage::NativeOTPFailed);
+        *out_json = strdup("{\"error\":\"OTP output allocation failed\"}");
+        return ANISETTE_ERR_LOADER_FAILED;
+    }
 
     uint64_t dsid = (uint64_t)-2;
     LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
@@ -883,22 +892,26 @@ struct IsolatedOTPVM {
     EmulatorVM *saved_vm;
     std::string saved_path, saved_id;
     bool saved_initialized;
+    bool saved_initialization_failed;
     std::unique_ptr<EmulatorVM> probe;
 
     IsolatedOTPVM()
         : saved_vm(g_shared_vm), saved_initialized(g_libraries_initialized),
+          saved_initialization_failed(g_vm_initialization_failed),
           probe(new EmulatorVM(true)) {
         probe->read_only_filesystem = true;
         saved_path.swap(g_current_prov_path);
         saved_id.swap(g_current_android_id);
         g_shared_vm = probe.get();
         g_libraries_initialized = false;
+        g_vm_initialization_failed = false;
     }
     ~IsolatedOTPVM() {
         g_shared_vm = saved_vm;
         g_current_prov_path.swap(saved_path);
         g_current_android_id.swap(saved_id);
         g_libraries_initialized = saved_initialized;
+        g_vm_initialization_failed = saved_initialization_failed;
         // probe is destroyed after restoring the regular provider's state.
     }
 };
@@ -987,15 +1000,25 @@ int32_t start_provision_uc(
 
     trace.add(NativeOTPStage::NativeSymbolOK);
     uint64_t spim_vm = vm->write_bytes(spim, spim_len);
-    uint64_t cpim_ptr = vm->heap.alloc(8);
-    uint64_t cpim_len_ptr = vm->heap.alloc(4);
-    uint64_t session_ptr = vm->heap.alloc(4);
+    uint64_t cpim_ptr = vm->allocate_guest(8);
+    uint64_t cpim_len_ptr = vm->allocate_guest(4);
+    uint64_t session_ptr = vm->allocate_guest(4);
+    if ((spim_len && !spim_vm) || !cpim_ptr || !cpim_len_ptr || !session_ptr) {
+        trace.add(NativeOTPStage::NativeStartFailed);
+        *out_json = strdup("{\"error\":\"Provisioning buffer allocation failed\"}");
+        return ANISETTE_ERR_LOADER_FAILED;
+    }
 
     uint64_t zero64 = 0;
     uint32_t zero32 = 0;
-    uc_mem_write(vm->uc, cpim_ptr, &zero64, sizeof(zero64));
-    uc_mem_write(vm->uc, cpim_len_ptr, &zero32, sizeof(zero32));
-    uc_mem_write(vm->uc, session_ptr, &zero32, sizeof(zero32));
+    if (uc_mem_write(vm->uc, cpim_ptr, &zero64, sizeof(zero64)) != UC_ERR_OK ||
+        uc_mem_write(vm->uc, cpim_len_ptr, &zero32, sizeof(zero32)) != UC_ERR_OK ||
+        uc_mem_write(vm->uc, session_ptr, &zero32, sizeof(zero32)) != UC_ERR_OK) {
+        vm->initialization_failed = true;
+        trace.add(NativeOTPStage::NativeStartFailed);
+        *out_json = strdup("{\"error\":\"Provisioning buffer initialization failed\"}");
+        return ANISETTE_ERR_LOADER_FAILED;
+    }
 
     uint64_t dsid = (uint64_t)-2;
     LOG_UC("[AnisetteKit - UC] Native operation progress.\n");

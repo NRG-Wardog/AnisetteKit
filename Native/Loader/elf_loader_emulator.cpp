@@ -146,15 +146,13 @@ static bool hook_mem_invalid(uc_engine *uc, uc_mem_type type,
 }
 
 uint64_t PageAllocator::alloc(uint64_t bytes) {
+    // Reject before any arithmetic or mutation; guest exhaustion must not abort
+    // the host process. Callers treat zero as a failed reservation.
+    if (!can_allocate(bytes)) return 0;
     uint64_t align_mask = alignment - 1;
     uint64_t aligned_size = (bytes + align_mask) & ~align_mask;
     if (aligned_size == 0) aligned_size = alignment;
 
-    if (offset + aligned_size > size) {
-        LOG_UC("[Emulator] Error: Out of virtual memory heap allocation range (needed %llu, offset %llu / %llu)!\n",
-               (unsigned long long)aligned_size, (unsigned long long)offset, (unsigned long long)size);
-        abort();
-    }
     uint64_t addr = base + offset;
     offset += aligned_size;
     return addr;
@@ -170,17 +168,20 @@ EmulatorVM::EmulatorVM(bool checked)
       next_import_address(kImportAddress),
       next_guest_fd(10)
 {
+    // Retain the argument for source compatibility; every VM is checked.
+    (void)checked;
     uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc);
     if (err != UC_ERR_OK) {
         LOG_UC("[Emulator] Failed on uc_open() with error returned: %u (%s)\n", err, uc_strerror(err));
-        if (checked) throw std::runtime_error("Isolated VM initialization failed");
-        abort();
+        // No engine is owned on a failed uc_open.
+        uc = nullptr;
+        throw std::runtime_error("VM engine initialization failed");
     }
 
     auto check = [&](uc_err result) {
-        if (checked && result != UC_ERR_OK) {
+        if (result != UC_ERR_OK) {
             uc_close(uc); uc = nullptr;
-            throw std::runtime_error("Isolated VM initialization failed");
+            throw std::runtime_error("VM mapping or hook initialization failed");
         }
     };
     check(uc_mem_map(uc, kHeapAddress, kHeapSize, UC_PROT_READ | UC_PROT_WRITE));
@@ -265,10 +266,72 @@ uint64_t EmulatorVM::register_import(const std::string &name) {
     return stub_addr;
 }
 
+static void fail_guest_operation(EmulatorVM *vm) noexcept {
+    vm->initialization_failed = true;
+    if (vm->uc) uc_emu_stop(vm->uc);
+}
+
+static bool checked_guest_read(EmulatorVM *vm, uint64_t address, void *data, size_t size) {
+    uint64_t end = 0;
+    // Host memory APIs do not stand in for guest page permissions. Preserve the
+    // VM's reserved no-access low page for these host-mediated transfers too.
+    if (vm->initialization_failed || (size && address < 0x10000) ||
+        !elf_metadata_bounds::add(address, size, end) ||
+        uc_mem_read(vm->uc, address, data, size) != UC_ERR_OK) {
+        fail_guest_operation(vm);
+        return false;
+    }
+    return true;
+}
+
+static bool checked_guest_write(EmulatorVM *vm, uint64_t address, const void *data, size_t size) {
+    uint64_t end = 0;
+    if (vm->initialization_failed || (size && address < 0x10000) ||
+        !elf_metadata_bounds::add(address, size, end) ||
+        uc_mem_write(vm->uc, address, data, size) != UC_ERR_OK) {
+        fail_guest_operation(vm);
+        return false;
+    }
+    return true;
+}
+
+static bool checked_register_read(EmulatorVM *vm, int reg, void *value) {
+    if (vm->initialization_failed || uc_reg_read(vm->uc, reg, value) != UC_ERR_OK) {
+        fail_guest_operation(vm);
+        return false;
+    }
+    return true;
+}
+
+static bool checked_register_write(EmulatorVM *vm, int reg, const void *value) {
+    if (vm->initialization_failed || uc_reg_write(vm->uc, reg, value) != UC_ERR_OK) {
+        fail_guest_operation(vm);
+        return false;
+    }
+    return true;
+}
+
+uint64_t EmulatorVM::allocate_guest(uint64_t bytes, uint64_t padding) {
+    uint64_t reserved = 0;
+    if (initialization_failed || !elf_metadata_bounds::add(bytes, padding, reserved)) {
+        fail_guest_operation(this);
+        return 0;
+    }
+    const uint64_t address = heap.alloc(reserved);
+    if (!address) { fail_guest_operation(this); return 0; }
+    try {
+        heap_allocation_sizes.emplace(address, bytes);
+    } catch (const std::exception &) {
+        fail_guest_operation(this);
+        return 0;
+    }
+    return address;
+}
+
 uint64_t EmulatorVM::write_bytes(const uint8_t *data, size_t len) {
     if (!data || len == 0) return 0;
-    uint64_t addr = heap.alloc(len + 16);
-    uc_mem_write(uc, addr, data, len);
+    uint64_t addr = allocate_guest(len, 16);
+    if (!addr || !checked_guest_write(this, addr, data, len)) return 0;
     return addr;
 }
 
@@ -293,52 +356,92 @@ static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data) {
 
 static void hook_malloc(EmulatorVM *vm) {
     uint64_t size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &size);
-    uint64_t ptr = vm->heap.alloc(size + 16);
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ptr);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &size)) return;
+    const uint64_t ptr = vm->allocate_guest(size, 16);
+    if (ptr) checked_register_write(vm, UC_ARM64_REG_X0, &ptr);
 }
 
 // Throwing C++ new cannot use the unknown-import zero-return fallback.
 // On allocation/register failure stop before the guest can dereference null.
 static void hook_cxx_new(EmulatorVM *vm) {
     uint64_t size = 0, pointer = 0;
-    if (uc_reg_read(vm->uc, UC_ARM64_REG_X0, &size) != UC_ERR_OK ||
-        !cxx_allocation_runtime::allocate(vm->heap, size, pointer) ||
-        uc_reg_write(vm->uc, UC_ARM64_REG_X0, &pointer) != UC_ERR_OK) {
-        vm->initialization_failed = true;
-        uc_emu_stop(vm->uc);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &size)) return;
+    pointer = vm->allocate_guest(size == 0 ? 1 : size);
+    if (pointer) checked_register_write(vm, UC_ARM64_REG_X0, &pointer);
+}
+
+static bool checked_guest_range(EmulatorVM *vm, uint64_t address, uint64_t size) {
+    uint64_t end = 0;
+    if (vm->initialization_failed || (size && address < 0x10000) ||
+        !elf_metadata_bounds::add(address, size, end)) {
+        fail_guest_operation(vm);
+        return false;
     }
+    return true;
+}
+
+static bool copy_guest_bytes(EmulatorVM *vm, uint64_t destination, uint64_t source, uint64_t size) {
+    if (!checked_guest_range(vm, source, size) || !checked_guest_range(vm, destination, size)) return false;
+    uint8_t buffer[4096];
+    for (uint64_t offset = 0; offset < size;) {
+        const size_t count = static_cast<size_t>((std::min)(size - offset, uint64_t(sizeof(buffer))));
+        if (!checked_guest_read(vm, source + offset, buffer, count) ||
+            !checked_guest_write(vm, destination + offset, buffer, count)) return false;
+        offset += count;
+    }
+    return true;
+}
+
+static bool fill_guest_bytes(EmulatorVM *vm, uint64_t destination, uint8_t value, uint64_t size) {
+    if (!checked_guest_range(vm, destination, size)) return false;
+    uint8_t buffer[4096];
+    memset(buffer, value, sizeof(buffer));
+    for (uint64_t offset = 0; offset < size;) {
+        const size_t count = static_cast<size_t>((std::min)(size - offset, uint64_t(sizeof(buffer))));
+        if (!checked_guest_write(vm, destination + offset, buffer, count)) return false;
+        offset += count;
+    }
+    return true;
 }
 
 static void hook_calloc(EmulatorVM *vm) {
     uint64_t num = 0, size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &num);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &size);
-    uint64_t total = num * size;
-    uint64_t ptr = vm->heap.alloc(total + 16);
-    std::vector<uint8_t> zeros(total, 0);
-    if (total > 0) {
-        uc_mem_write(vm->uc, ptr, zeros.data(), total);
-    }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ptr);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &num) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &size)) return;
+    uint64_t total = 0;
+    if (!elf_metadata_bounds::multiply(num, size, total)) { fail_guest_operation(vm); return; }
+    const uint64_t ptr = vm->allocate_guest(total, 16);
+    if (!ptr || !fill_guest_bytes(vm, ptr, 0, total)) return;
+    checked_register_write(vm, UC_ARM64_REG_X0, &ptr);
 }
 
 static void hook_realloc(EmulatorVM *vm) {
     uint64_t ptr = 0, new_size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &ptr);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &new_size);
-    uint64_t new_ptr = vm->heap.alloc(new_size + 16);
-    if (ptr != 0 && new_size > 0) {
-        std::vector<uint8_t> buf(new_size);
-        uc_mem_read(vm->uc, ptr, buf.data(), new_size);
-        uc_mem_write(vm->uc, new_ptr, buf.data(), new_size);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &ptr) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &new_size)) return;
+    uint64_t old_size = 0;
+    if (ptr) {
+        const auto old = vm->heap_allocation_sizes.find(ptr);
+        if (old == vm->heap_allocation_sizes.end()) { fail_guest_operation(vm); return; }
+        old_size = old->second;
     }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &new_ptr);
+    const uint64_t new_ptr = vm->allocate_guest(new_size, 16);
+    if (!new_ptr) return;
+    if (!copy_guest_bytes(vm, new_ptr, ptr, (std::min)(old_size, new_size)) ||
+        !checked_register_write(vm, UC_ARM64_REG_X0, &new_ptr)) {
+        vm->heap_allocation_sizes.erase(new_ptr);
+        return;
+    }
+    // Existing zero-size semantics are retained: a distinct arena allocation.
+    if (ptr) vm->heap_allocation_sizes.erase(ptr);
 }
 
 static void hook_free(EmulatorVM *vm) {
+    uint64_t ptr = 0;
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &ptr)) return;
+    vm->heap_allocation_sizes.erase(ptr);
     uint64_t ret = 0;
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
+    checked_register_write(vm, UC_ARM64_REG_X0, &ret);
 }
 
 static void hook_strlen(EmulatorVM *vm) {
@@ -393,81 +496,71 @@ static void hook_strncmp(EmulatorVM *vm) {
 
 static void hook_strcpy(EmulatorVM *vm) {
     uint64_t dst = 0, src = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &dst);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &src);
-    char c = 0;
-    uint64_t offset = 0;
-    if (src && dst) {
-        do {
-            if (uc_mem_read(vm->uc, src + offset, &c, 1) != UC_ERR_OK) break;
-            uc_mem_write(vm->uc, dst + offset, &c, 1);
-            offset++;
-        } while (c != '\0');
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &dst) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &src)) return;
+    for (uint64_t offset = 0;; ++offset) {
+        uint64_t from = 0, to = 0;
+        if (!elf_metadata_bounds::add(src, offset, from) || !elf_metadata_bounds::add(dst, offset, to)) {
+            fail_guest_operation(vm); return;
+        }
+        char c = 0;
+        if (!checked_guest_read(vm, from, &c, 1) || !checked_guest_write(vm, to, &c, 1)) return;
+        if (!c) break;
     }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &dst);
+    checked_register_write(vm, UC_ARM64_REG_X0, &dst);
 }
 
 static void hook_strncpy(EmulatorVM *vm) {
-    uint64_t dst = 0, src = 0, n = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &dst);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &src);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &n);
-    char c = 0;
-    bool null_reached = false;
-    for (uint64_t i = 0; i < n; i++) {
-        if (!null_reached) {
-            if (uc_mem_read(vm->uc, src + i, &c, 1) == UC_ERR_OK) {
-                if (c == '\0') null_reached = true;
-            } else {
-                null_reached = true;
-                c = '\0';
-            }
-        } else {
-            c = '\0';
-        }
-        uc_mem_write(vm->uc, dst + i, &c, 1);
+    uint64_t dst = 0, src = 0, size = 0;
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &dst) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &src) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &size) ||
+        !checked_guest_range(vm, src, size) || !checked_guest_range(vm, dst, size)) return;
+    bool ended = false;
+    for (uint64_t offset = 0; offset < size; ++offset) {
+        char c = 0;
+        if (!ended && !checked_guest_read(vm, src + offset, &c, 1)) return;
+        if (!c) ended = true;
+        if (!checked_guest_write(vm, dst + offset, &c, 1)) return;
     }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &dst);
+    checked_register_write(vm, UC_ARM64_REG_X0, &dst);
 }
 
 static void hook_memcpy(EmulatorVM *vm) {
     uint64_t dst = 0, src = 0, size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &dst);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &src);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &size);
-    if (size > 0 && dst != 0 && src != 0) {
-        std::vector<uint8_t> buf(size);
-        uc_mem_read(vm->uc, src, buf.data(), size);
-        uc_mem_write(vm->uc, dst, buf.data(), size);
-    }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &dst);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &dst) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &src) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &size)) return;
+    if (!copy_guest_bytes(vm, dst, src, size)) return;
+    checked_register_write(vm, UC_ARM64_REG_X0, &dst);
 }
 
 static void hook_memset(EmulatorVM *vm) {
     uint64_t dst = 0, val = 0, size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &dst);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &val);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &size);
-    if (size > 0 && dst != 0) {
-        std::vector<uint8_t> buf(size, (uint8_t)val);
-        uc_mem_write(vm->uc, dst, buf.data(), size);
-    }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &dst);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &dst) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &val) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &size)) return;
+    if (!fill_guest_bytes(vm, dst, static_cast<uint8_t>(val), size)) return;
+    checked_register_write(vm, UC_ARM64_REG_X0, &dst);
 }
 
 static void hook_memcmp(EmulatorVM *vm) {
-    uint64_t s1 = 0, s2 = 0, n = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &s1);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &s2);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &n);
-    int64_t res = 0;
-    if (n > 0 && s1 && s2) {
-        std::vector<uint8_t> b1(n), b2(n);
-        uc_mem_read(vm->uc, s1, b1.data(), n);
-        uc_mem_read(vm->uc, s2, b2.data(), n);
-        res = memcmp(b1.data(), b2.data(), n);
+    uint64_t first = 0, second = 0, size = 0;
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &first) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &second) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &size) ||
+        !checked_guest_range(vm, first, size) || !checked_guest_range(vm, second, size)) return;
+    uint8_t left[4096], right[4096];
+    int64_t result = 0;
+    for (uint64_t offset = 0; offset < size;) {
+        const size_t count = static_cast<size_t>((std::min)(size - offset, uint64_t(sizeof(left))));
+        if (!checked_guest_read(vm, first + offset, left, count) ||
+            !checked_guest_read(vm, second + offset, right, count)) return;
+        result = memcmp(left, right, count);
+        if (result) break;
+        offset += count;
     }
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
+    checked_register_write(vm, UC_ARM64_REG_X0, &result);
 }
 
 static void hook_memchr(EmulatorVM *vm) {
@@ -585,9 +678,10 @@ static void hook_close(EmulatorVM *vm) {
 
 static void hook_read(EmulatorVM *vm) {
     uint64_t guest_fd = 0, buf_ptr = 0, count = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &guest_fd);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &buf_ptr);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &count);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &guest_fd) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &buf_ptr) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &count) ||
+        !checked_guest_range(vm, buf_ptr, count)) return;
     int64_t res = -1;
     int observed_read_errno = 0, observed_copy = -1;
     auto it = vm->fd_map.find((int)guest_fd);
@@ -597,6 +691,7 @@ static void hook_read(EmulatorVM *vm) {
         observed_read_errno = bytes_read < 0 ? errno : 0;
         if (bytes_read > 0) {
             observed_copy = static_cast<int>(uc_mem_write(vm->uc, buf_ptr, tmp.data(), bytes_read));
+            if (observed_copy != UC_ERR_OK) fail_guest_operation(vm);
         }
         if (activeADIConsumptionDebug) activeADIConsumptionDebug->observeRead(
             static_cast<int>(guest_fd), tmp.data(), bytes_read > 0 ? static_cast<uint64_t>(bytes_read) : 0, observed_copy);
@@ -605,26 +700,27 @@ static void hook_read(EmulatorVM *vm) {
     if (activeADIConsumptionDebug) activeADIConsumptionDebug->record(ADIConsumptionDebug::Read,
         activeADIConsumptionDebug->lookup(static_cast<int>(guest_fd)),res < 0 ? -1 : (res == 0 ? 0 : 1),
         observed_read_errno,count,res > 0 ? static_cast<uint64_t>(res) : 0,observed_copy);
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
+    if (!vm->initialization_failed) checked_register_write(vm, UC_ARM64_REG_X0, &res);
 }
 
 static void hook_write(EmulatorVM *vm) {
     if (deny_read_only_mutation(vm)) return;
     uint64_t guest_fd = 0, buf_ptr = 0, count = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &guest_fd);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X1, &buf_ptr);
-    uc_reg_read(vm->uc, UC_ARM64_REG_X2, &count);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &guest_fd) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &buf_ptr) ||
+        !checked_register_read(vm, UC_ARM64_REG_X2, &count) ||
+        !checked_guest_range(vm, buf_ptr, count)) return;
     int64_t res = -1;
     auto it = vm->fd_map.find((int)guest_fd);
     if (it != vm->fd_map.end()) {
         std::vector<uint8_t> tmp(count);
-        uc_mem_read(vm->uc, buf_ptr, tmp.data(), count);
+        if (!checked_guest_read(vm, buf_ptr, tmp.data(), count)) return;
         res = (int64_t)write(it->second, tmp.data(), count);
     }
     // A successful write advances the stream outside passive read coverage.
     if (res > 0 && activeADIConsumptionDebug)
         activeADIConsumptionDebug->invalidateOffset(static_cast<int>(guest_fd));
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
+    checked_register_write(vm, UC_ARM64_REG_X0, &res);
 }
 
 static void hook_ftruncate(EmulatorVM *vm) {
@@ -917,9 +1013,9 @@ static void hook_cxa_guard_release(EmulatorVM *vm) {
 
 static void hook_cxa_allocate_exception(EmulatorVM *vm) {
     uint64_t size = 0;
-    uc_reg_read(vm->uc, UC_ARM64_REG_X0, &size);
-    uint64_t ptr = vm->heap.alloc(size + 128);
-    uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ptr);
+    if (!checked_register_read(vm, UC_ARM64_REG_X0, &size)) return;
+    const uint64_t ptr = vm->allocate_guest(size, 128);
+    if (ptr) checked_register_write(vm, UC_ARM64_REG_X0, &ptr);
 }
 
 static void hook_dynamic_cast(EmulatorVM *vm) {
@@ -1033,6 +1129,7 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
     EmulatorVM *vm = (EmulatorVM *)user_data;
     if (!vm) vm = g_active_vm;
     if (!vm) return;
+    if (vm->initialization_failed) { uc_emu_stop(uc); return; }
 
     auto it = vm->import_stubs.find(address);
     if (it == vm->import_stubs.end()) {
@@ -1041,6 +1138,8 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
 
     const std::string &name = it->second;
 
+    // Host allocation failures must not unwind through Unicorn's C callback.
+    try {
     const auto cxx_operation = cxx_allocation_runtime::classify(name);
     if (cxx_operation == cxx_allocation_runtime::Operation::New) hook_cxx_new(vm);
     // Matches this VM's existing free semantics: arena lifetime is the VM.
@@ -1100,6 +1199,9 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
 
         uint64_t ret = 0;
         uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
+    }
+    } catch (const std::exception &) {
+        fail_guest_operation(vm);
     }
 }
 
@@ -1240,8 +1342,7 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
         lib.min_vaddr = lib.metadata.min_vaddr;
         lib.max_vaddr = lib.metadata.max_vaddr;
         const uint64_t total_span = lib.max_vaddr - lib.min_vaddr;
-        // Preserve PageAllocator's ABI/behavior. Reject an exhausted arena
-        // before invoking its abort-on-exhaustion API.
+        // Reject an exhausted arena before reserving its checked span.
         if (!vm->library_alloc.can_allocate(total_span)) return fail("library arena exhausted");
         lib.base_address = vm->library_alloc.alloc(total_span);
         auto translate = [&](uint64_t value, uint64_t bytes, uint64_t &address) {

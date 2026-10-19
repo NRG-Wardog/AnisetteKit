@@ -13,11 +13,12 @@
 #define UC_ERR_OK 0
 enum {UC_ARM64_REG_X0,UC_ARM64_REG_X1,UC_ARM64_REG_X2};
 struct Fake {uint64_t r[3]={}; unsigned char mem[4096]={}; bool fail_copy=false;};
-struct EmulatorVM {Fake *uc; uint64_t errno_addr=16; int next_guest_fd=10;std::unordered_map<int,int> fd_map;};
+struct EmulatorVM {Fake *uc; uint64_t errno_addr=0x10010; bool initialization_failed=false; int next_guest_fd=10;std::unordered_map<int,int> fd_map;};
 int uc_reg_read(Fake*u,int r,void*p){memcpy(p,&u->r[r],8);return 0;}
 int uc_reg_write(Fake*u,int r,const void*p){memcpy(&u->r[r],p,8);return 0;}
-int uc_mem_read(Fake*u,uint64_t a,void*p,size_t n){if(a+n>4096)return 1;memcpy(p,u->mem+a,n);return 0;}
-int uc_mem_write(Fake*u,uint64_t a,const void*p,size_t n){if(a+n>4096 || (u->fail_copy && a==512))return 1;memcpy(u->mem+a,p,n);return 0;}
+int uc_mem_read(Fake*u,uint64_t a,void*p,size_t n){if(a<0x10000)return 1;a-=0x10000;if(a+n>4096)return 1;memcpy(p,u->mem+a,n);return 0;}
+int uc_mem_write(Fake*u,uint64_t a,const void*p,size_t n){if(a<0x10000)return 1;a-=0x10000;if(a+n>4096 || (u->fail_copy && a==512))return 1;memcpy(u->mem+a,p,n);return 0;}
+int uc_emu_stop(Fake*) { return 0; }
 bool deny_read_only_mutation(EmulatorVM*){return false;}
 #include "adi_consumption_debug.h"
 
@@ -54,19 +55,21 @@ int main(){
  Fake f;EmulatorVM v{&f};
  {
  ADIConsumptionScope scope(&debug);adiConsumptionPhase(ADIConsumptionDebug::OTP);
- strcpy((char*)f.mem+128,path);f.r[0]=128;f.r[1]=0;f.r[2]=0;hook_open(&v);int g=f.r[0];assert(g>=10);
- f.r[0]=g;f.r[1]=512;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==4 && memcmp(f.mem+512,"DATA",4)==0);
- assert(lseek(v.fd_map[g],0,SEEK_SET)==0);memset(f.mem+512,0,4);f.fail_copy=true;f.r[0]=g;f.r[1]=512;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==4 && memcmp(f.mem+512,"DATA",4)!=0);
- f.fail_copy=false;f.r[0]=g;f.r[1]=512;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==0);
- uint32_t sentinel=77;memcpy(f.mem+16,&sentinel,4);close(v.fd_map[g]);f.r[0]=g;f.r[1]=512;f.r[2]=4;hook_read(&v);uint32_t guest_errno=0;memcpy(&guest_errno,f.mem+16,4);assert((int64_t)f.r[0]==-1 && guest_errno==77);
+ strcpy((char*)f.mem+128,path);f.r[0]=0x10080;f.r[1]=0;f.r[2]=0;hook_open(&v);int g=f.r[0];assert(g>=10);
+ f.r[0]=g;f.r[1]=0x10200;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==4 && memcmp(f.mem+512,"DATA",4)==0);
+ assert(lseek(v.fd_map[g],0,SEEK_SET)==0);memset(f.mem+512,0,4);f.fail_copy=true;f.r[0]=g;f.r[1]=0x10200;f.r[2]=4;hook_read(&v);assert(v.initialization_failed && (int64_t)f.r[0]==g && memcmp(f.mem+512,"DATA",4)!=0);
+ // Reset only the synthetic case state to exercise independent observation cases.
+ v.initialization_failed=false;
+ f.fail_copy=false;f.r[0]=g;f.r[1]=0x10200;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==0);
+ uint32_t sentinel=77;memcpy(f.mem+16,&sentinel,4);close(v.fd_map[g]);f.r[0]=g;f.r[1]=0x10200;f.r[2]=4;hook_read(&v);uint32_t guest_errno=0;memcpy(&guest_errno,f.mem+16,4);assert((int64_t)f.r[0]==-1 && guest_errno==77);
  f.r[0]=g;hook_close(&v);assert((int64_t)f.r[0]==0); // Original ignored close failure is preserved.
- unlink(path);f.r[0]=128;f.r[1]=0;f.r[2]=0;hook_open(&v);memcpy(&guest_errno,f.mem+16,4);assert((int64_t)f.r[0]==-1 && guest_errno==ENOENT);
+ unlink(path);f.r[0]=0x10080;f.r[1]=0;f.r[2]=0;hook_open(&v);memcpy(&guest_errno,f.mem+16,4);assert((int64_t)f.r[0]==-1 && guest_errno==ENOENT);
  }
  assert(activeADIConsumptionDebug==nullptr);
  {
  ADIConsumptionScope scope(&debug);adiConsumptionPhase(ADIConsumptionDebug::LibraryInit);
- injected_open_errno=EACCES;f.r[0]=128;f.r[1]=0;f.r[2]=0;hook_open(&v);assert((int64_t)f.r[0]==-1);injected_open_errno=0;
- f.r[0]=999;f.r[1]=512;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==-1);
+ injected_open_errno=EACCES;f.r[0]=0x10080;f.r[1]=0;f.r[2]=0;hook_open(&v);assert((int64_t)f.r[0]==-1);injected_open_errno=0;
+ f.r[0]=999;f.r[1]=0x10200;f.r[2]=4;hook_read(&v);assert((int64_t)f.r[0]==-1);
  }
 #if ADI_CONSUMER_DEBUG_ENABLED
  assert(debug.count==8);assert(debug.events[0].target==ADIConsumptionDebug::ExpectedBlob && debug.events[0].phase==ADIConsumptionDebug::OTP);
@@ -118,11 +121,11 @@ struct SyntheticStream {
     }
     void open(int flags=0) {
         strcpy(reinterpret_cast<char *>(fake.mem)+128,path);
-        fake.r[0]=128;fake.r[1]=flags;fake.r[2]=0;hook_open(&vm);
+        fake.r[0]=0x10080;fake.r[1]=flags;fake.r[2]=0;hook_open(&vm);
         guest=static_cast<int>(fake.r[0]);assert(guest>=10);
     }
     int64_t read(unsigned count, bool failCopy=false) {
-        fake.fail_copy=failCopy;fake.r[0]=guest;fake.r[1]=512;fake.r[2]=count;
+        fake.fail_copy=failCopy;fake.r[0]=guest;fake.r[1]=0x10200;fake.r[2]=count;
         errno=93;hook_read(&vm);assert(errno==93);
         return static_cast<int64_t>(fake.r[0]);
     }
@@ -150,11 +153,11 @@ void comparison_fixtures() {
     { SyntheticStream s("",input);assert(s.read(10)==0);s.state(0,0); }
     { SyntheticStream s(different,input);assert(s.read(4)==4);s.state(2,0);assert(s.read(6)==6);s.state(2,0); }
     { SyntheticStream s(input,shortInput);assert(s.read(4)==4);s.state(1,1);assert(s.read(6)==6);s.state(2,0); }
-    { SyntheticStream s(input,input);assert(s.read(4,true)==4);s.state(1,0);assert(s.read(6)==6);s.state(1,0); }
+    { SyntheticStream s(input,input);assert(s.read(4,true)==s.guest && s.vm.initialization_failed);s.state(1,0);assert(s.read(6)==s.guest);s.state(1,0); }
     { SyntheticStream s(input,input,0,false);assert(s.read(10)==10);s.state(0,0); }
     { SyntheticStream s(input,input);assert(s.read(4)==4);const int reused=s.guest;s.close();s.vm.next_guest_fd=reused;s.open();assert(s.guest==reused);assert(s.read(6)==6);s.state(1,0);assert(s.read(4)==4);s.state(1,1); }
     { SyntheticStream s(input,input);assert(s.read(4)==4);s.debug.forget(s.guest);assert(s.read(6)==6);s.state(1,0); }
-    { SyntheticStream s(input,input,2);assert(s.read(4)==4);s.fake.mem[512]='-';s.fake.r[0]=s.guest;s.fake.r[1]=512;s.fake.r[2]=1;errno=96;hook_write(&s.vm);assert(s.fake.r[0]==1 && errno==96);assert(s.read(5)==5);s.state(1,0); }
+    { SyntheticStream s(input,input,2);assert(s.read(4)==4);s.fake.mem[512]='-';s.fake.r[0]=s.guest;s.fake.r[1]=0x10200;s.fake.r[2]=1;errno=96;hook_write(&s.vm);assert(s.fake.r[0]==1 && errno==96);assert(s.read(5)==5);s.state(1,0); }
     { SyntheticStream s(input,"");assert(s.read(10)==10);s.state(0,0); }
 #if ADI_CONSUMER_DEBUG_ENABLED
     const uint8_t *bytes=reinterpret_cast<const uint8_t *>(input.data());

@@ -103,6 +103,8 @@ struct EmulatorVM {
     uc_engine *uc;
     PageAllocator heap;
     PageAllocator library_alloc;
+    // Requested extents, not arena padding. Arena storage lives until VM close.
+    std::unordered_map<uint64_t, uint64_t> heap_allocation_sizes;
     
     std::unordered_map<std::string, uint64_t> imported_symbols;
     std::unordered_map<uint64_t, std::string> import_stubs;
@@ -118,10 +120,12 @@ struct EmulatorVM {
 
     std::vector<LibraryInfo> loaded_libraries;
 
+    // Legacy argument retained for source compatibility; all modes are checked.
     explicit EmulatorVM(bool checked = false);
     ~EmulatorVM();
 
     uint64_t register_import(const std::string &name);
+    uint64_t allocate_guest(uint64_t bytes, uint64_t padding = 0);
     uint64_t write_bytes(const uint8_t *data, size_t len);
     uint64_t write_string(const char *str);
 };

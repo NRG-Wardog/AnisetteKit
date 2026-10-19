@@ -38,6 +38,12 @@ struct EmulatorVM {
         uc = new uc_engine; ++constructed;
     }
     ~EmulatorVM() { delete uc; ++destroyed; }
+    uint64_t allocate_guest(uint64_t size, uint64_t padding = 0) {
+        if (initialization_failed || padding > UINT64_MAX - size) {
+            initialization_failed = true; return 0;
+        }
+        return heap.alloc(size + padding);
+    }
     uint64_t write_bytes(const uint8_t *bytes, size_t size) {
         auto a=heap.alloc(size); uc_mem_write(uc,a,bytes,size); return a;
     }

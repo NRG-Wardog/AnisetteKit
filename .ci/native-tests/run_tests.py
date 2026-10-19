@@ -227,7 +227,11 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         compiler = shutil.which('c++') or shutil.which('g++')
         loader = source('Native/Loader/elf_loader_emulator.cpp')
         signatures = ['uint64_t PageAllocator::alloc(', 'EmulatorVM::EmulatorVM(',
-                      'EmulatorVM::~EmulatorVM()', 'uint64_t EmulatorVM::write_bytes(',
+                      'EmulatorVM::~EmulatorVM()', 'static void fail_guest_operation(',
+                      'static bool checked_guest_read(', 'static bool checked_guest_write(',
+                      'static bool checked_register_read(', 'static bool checked_register_write(',
+                      'static bool checked_guest_range(', 'uint64_t EmulatorVM::allocate_guest(',
+                      'uint64_t EmulatorVM::write_bytes(',
                       'uint64_t EmulatorVM::write_string(', 'static bool deny_read_only_mutation(',
                       'static int linux_to_darwin_open_flags(', 'int32_t run_vm_procedure(',
                       'bool load_library_to_vm(']
@@ -258,6 +262,7 @@ uc_err uc_mem_read(uc_engine*,uint64_t,void*,size_t);
 uc_err uc_reg_write(uc_engine*,int,const void*);uc_err uc_reg_read(uc_engine*,int,void*);
 uc_err uc_hook_add(uc_engine*,uc_hook*,int,void*,void*,uint64_t,uint64_t);
 uc_err uc_emu_start(uc_engine*,uint64_t,uint64_t,uint64_t,size_t);
+uc_err uc_emu_stop(uc_engine*);
 const char* uc_strerror(uc_err);
 '''
             (build / 'unicorn/unicorn.h').write_text(header)
@@ -276,9 +281,13 @@ const char* uc_strerror(uc_err);
     def test_actual_consumer_hooks_observe_without_changing_results(self):
         compiler = shutil.which('c++') or shutil.which('g++')
         loader = source('Native/Loader/elf_loader_emulator.cpp')
-        signatures = ['static int linux_to_darwin_open_flags(', 'static void hook_open(',
+        signatures = ['static void fail_guest_operation(', 'static bool checked_guest_read(',
+                      'static bool checked_guest_write(', 'static bool checked_register_read(',
+                      'static bool checked_register_write(', 'static bool checked_guest_range(',
+                      'static int linux_to_darwin_open_flags(', 'static void hook_open(',
                       'static void hook_read(', 'static void hook_close(', 'static void hook_write(']
-        functions = '\n\n'.join(declaration(loader, name) for name in signatures)
+        functions = 'namespace elf_metadata_bounds {\n' + declaration(source('Native/Loader/elf_metadata_bounds.h'), 'inline bool add(') + '\n}\n'
+        functions += '\n\n'.join(declaration(loader, name) for name in signatures)
         with tempfile.TemporaryDirectory() as directory:
             build = Path(directory)
             shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
