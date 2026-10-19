@@ -12,9 +12,15 @@ import anisette_core
 
 public protocol AnisetteDataProvider: Sendable {
     var requiresLocalLibraries: Bool { get }
+    /// Releases an unfinished remote provisioning session. Native providers are no-ops.
+    func cancelProvisioning(session: UInt32)
     func getAnisetteHeaders(libDir: String, provisioningDir: String, identifier: [UInt8], adiPb: [UInt8]) async throws -> AnisetteDataResponse
     func startProvision(libDir: String, provisioningDir: String, identifier: [UInt8], spim: [UInt8]) async throws -> (cpim: Data, session: UInt32)
     func endProvision(libDir: String, provisioningDir: String, identifier: [UInt8], session: UInt32, ptm: [UInt8], tk: [UInt8]) async throws -> Data
+}
+
+public extension AnisetteDataProvider {
+    func cancelProvisioning(session: UInt32) {}
 }
 
 public typealias CStringPointer = UnsafeMutablePointer<CChar>

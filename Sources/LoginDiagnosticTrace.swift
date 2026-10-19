@@ -16,6 +16,8 @@ public enum LoginDiagnosticStage: Int, CaseIterable, Sendable {
     case nativeSetup, nativeVM, nativeLibraryLoad, nativeConstructors, nativePath
     case nativeIdentifier, nativeSymbol, nativeOutput, nativeCleanup, nativeCall
     case nativeLibraryInitialization, nativeRelocation
+    // Append only: existing stage IDs remain stable for diagnostic consumers.
+    case remoteDescriptor, remoteStart, remoteEnd, remoteHeaders
 }
 public enum LoginDiagnosticOutcome: Int, Sendable { case started, succeeded, failed, skipped }
 public enum LoginDiagnosticReason: Int, Sendable {

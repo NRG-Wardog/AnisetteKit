@@ -10,9 +10,11 @@ import Foundation
 
 public struct AnisetteDataResponse: Sendable, Codable, Equatable, Hashable {
     public let oneTimePassword: String
+    public let routingInfo: String?
     public let machineID: String
 
-    public init(oneTimePassword: String, machineID: String) {
+    public init(oneTimePassword: String, machineID: String, routingInfo: String? = nil) {
+        self.routingInfo = routingInfo
         self.oneTimePassword = oneTimePassword
         self.machineID = machineID
     }
@@ -23,6 +25,7 @@ public struct AnisetteDataResponse: Sendable, Codable, Equatable, Hashable {
         {
             throw AnisetteError.invalidResponse(reason: "Missing \(AnisetteConstants.Headers.oneTimePassword) or \(AnisetteConstants.Headers.machineID) from response")
         }
+        self.routingInfo = nil // Historical parsing remains unchanged.
         self.oneTimePassword = otp
         self.machineID = mid
     }

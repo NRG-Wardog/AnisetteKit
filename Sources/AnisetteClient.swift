@@ -15,6 +15,8 @@ import anisette_core
 public enum ProvisioningStorage: Equatable, Sendable {
     case disk
     case memory(existingBlob: Data? = nil)
+    /// Remote-only: no provisioning files, cleanup, or disk routing-info reads.
+    case ephemeral(existingBlob: Data? = nil)
 }
 
 public protocol AnisetteClientProtocol: Sendable {
@@ -38,6 +40,8 @@ public extension AnisetteClientProtocol {
         )
     }
 }
+public typealias AnisetteRequestTransport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
 public typealias LibraryDirectoryResolver = @Sendable () throws -> URL
 
 public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
@@ -49,6 +53,7 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
     public let lookupURL: URL
     public let requiredLibraries: [String]
     public let provider: any AnisetteDataProvider
+    private let requestTransport: AnisetteRequestTransport?
 
     let routingInfoLock = NSLock()
     var routingInfoCache = [UUID: String]()
@@ -60,6 +65,7 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         lookupURL: URL = AnisetteConstants.URLs.grandSlamLookup,
         requiredLibraries: [String] = AnisetteConstants.Libraries.requiredNames,
         provider: (any AnisetteDataProvider)? = nil,
+        requestTransport: AnisetteRequestTransport? = nil,
         libraryDirectoryResolver: LibraryDirectoryResolver? = nil
     ) throws {
         let diagnosticSpan = LoginDiagnosticTrace.current?.begin(.clientInitialization)
@@ -69,6 +75,7 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         self.userAgent = userAgent
         self.lookupURL = lookupURL
         self.requiredLibraries = requiredLibraries
+        self.requestTransport = requestTransport
 
         let resolvedProvider: any AnisetteDataProvider = provider ?? {
             #if os(macOS)
@@ -149,13 +156,20 @@ extension AnisetteClient {
         customHeaders: AnisetteRequestHeaders?,
         provider: any AnisetteDataProvider
     ) async throws -> (headers: [String: String], newBlob: Data?) {
+        let ephemeral: Bool
+        if case .ephemeral = storage {
+            // This API must never enter a native provider, even accidentally.
+            guard !provider.requiresLocalLibraries else { throw AnisetteError.invalidArgument }
+            ephemeral = true
+            try Task.checkCancellation()
+        } else { ephemeral = false }
         let (adiPbData, generatedBlob, cleanup) = try await withLoginDiagnosticStage(.provisioningBlob) {
         try await resolveProvisioningBlob(
             identifier: identifier,
             storage: storage,
             headers: customHeaders
         ) {
-            try await self.runProvisioningFlow(identifier: identifier, headers: customHeaders, provider: provider)
+            try await self.runProvisioningFlow(identifier: identifier, headers: customHeaders, provider: provider, persistRoutingInfo: !ephemeral)
         }
         }
         defer {
@@ -165,7 +179,7 @@ extension AnisetteClient {
             span?.finish(.skipped, reason: .unavailable)
         }
 
-        let response = try await withLoginDiagnosticStage(.nativeOTP) {
+        let response = try await withLoginDiagnosticStage(provider.requiresLocalLibraries ? .nativeOTP : .remoteHeaders) {
         try await provider.getAnisetteHeaders(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
@@ -181,12 +195,17 @@ extension AnisetteClient {
                 $0.oneTimePassword = response.oneTimePassword
                 $0.machineID       = response.machineID
                 if $0.deviceID == nil { $0.deviceID = identifier.uuidString.uppercased() }
-                if let storedRinfo = getStoredRoutingInfo(for: identifier) { $0.routingInfo = storedRinfo }
+                if let responseRinfo = response.routingInfo {
+                    $0.routingInfo = responseRinfo
+                } else if let storedRinfo = ephemeral ? getCachedRoutingInfo(for: identifier) : getStoredRoutingInfo(for: identifier) {
+                    $0.routingInfo = storedRinfo
+                }
                 if $0.date == nil && $0.clientTime == nil { $0.date = Date() }
                 if customHeaders?.clientInfo == nil { $0.clientInfo = self.clientInfo }
                 if customHeaders?.userAgent == nil { $0.userAgent = self.userAgent }
             }
 
+        if ephemeral { try Task.checkCancellation() }
         let result = (AnisetteHeadersDTO.toDictionary(from: headers), generatedBlob)
         headerSpan?.finish(.succeeded)
         return result
@@ -198,6 +217,17 @@ extension AnisetteClient {
         headers customHeaders: AnisetteRequestHeaders? = nil,
         provisioner: () async throws -> Data
     ) async throws -> (data: Data, generated: Data?, cleanup: () -> Void) {
+        // Return before even constructing paths. An ephemeral request owns no files.
+        if case .ephemeral(let existing) = storage {
+            if let existing {
+                guard !existing.isEmpty else { throw AnisetteError.invalidArgument }
+                LoginDiagnosticTrace.current?.skip(.provisioning, reason: .cached)
+                return (existing, nil, {})
+            }
+            let blob = try await withLoginDiagnosticStage(.provisioning) { try await provisioner() }
+            try Task.checkCancellation()
+            return (blob, blob, {})
+        }
         let uuidProvDir = provisioningDir.appendingPathComponent(identifier.uuidString.lowercased())
         let adiPbURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.adiPb)
         let rinfoURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.rinfo)
@@ -215,6 +245,8 @@ extension AnisetteClient {
         }
 
         switch storage {
+        case .ephemeral:
+            throw AnisetteError.invalidArgument // handled above, before filesystem access
         case .disk:
             if !FileManager.default.fileExists(atPath: adiPbURL.path) {
                 verboseLog("[AnisetteKit] Native adi.pb missing. Starting automatic local provisioning...")
@@ -257,7 +289,8 @@ extension AnisetteClient {
     func runProvisioningFlow(
         identifier: UUID,
         headers customHeaders: AnisetteRequestHeaders? = nil,
-        provider: any AnisetteDataProvider
+        provider: any AnisetteDataProvider,
+        persistRoutingInfo: Bool = true
     ) async throws -> Data {
         verboseLog("[AnisetteKit] Fetching provisioning URLs from Apple lookup...")
         let lookupURL = self.lookupURL
@@ -284,7 +317,7 @@ extension AnisetteClient {
         }
         if let spimRinfo = spimRinfo { activeRoutingInfo = spimRinfo }
 
-        let provResult = try await withLoginDiagnosticStage(.nativeStart) {
+        let provResult = try await withLoginDiagnosticStage(provider.requiresLocalLibraries ? .nativeStart : .remoteStart) {
         try await provider.startProvision(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
@@ -293,13 +326,16 @@ extension AnisetteClient {
         )
         }
 
+        // A remote socket must also close if Apple finish or cancellation fails.
+        defer { provider.cancelProvisioning(session: provResult.session) }
+        if !persistRoutingInfo { try Task.checkCancellation() }
         verboseLog("[AnisetteKit] Sending CPIM to Apple finish provisioning...")
         let (ptm, tk, ptmRinfo) = try await withLoginDiagnosticStage(.appleFinish) {
             try await fetchPtmTk(endURL: endURL, cpim: provResult.cpim, identifier: identifier, routingInfo: activeRoutingInfo, headers: customHeaders)
         }
         if let ptmRinfo = ptmRinfo { activeRoutingInfo = ptmRinfo }
 
-        let adiPb = try await withLoginDiagnosticStage(.nativeEnd) {
+        let adiPb = try await withLoginDiagnosticStage(provider.requiresLocalLibraries ? .nativeEnd : .remoteEnd) {
         try await provider.endProvision(
             libDir: libDir?.path ?? "",
             provisioningDir: provisioningDir.path,
@@ -312,10 +348,12 @@ extension AnisetteClient {
 
         if let finalRinfo = activeRoutingInfo {
             setCachedRoutingInfo(finalRinfo, for: identifier)
+            if persistRoutingInfo {
             let uuidProvDir = provisioningDir.appendingPathComponent(identifier.uuidString.lowercased())
             try? FileManager.default.createDirectory(at: uuidProvDir, withIntermediateDirectories: true, attributes: nil)
             let rinfoURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.rinfo)
             try? finalRinfo.write(to: rinfoURL, atomically: true, encoding: String.Encoding.utf8)
+            }
         }
 
         return adiPb
@@ -344,7 +382,15 @@ extension AnisetteClient {
     }
 
     private func sendRequest(_ req: URLRequest, step: String, endpointName: String) async throws -> (data: Data, response: URLResponse) {
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let data: Data
+        let resp: URLResponse
+        if let requestTransport {
+            try Task.checkCancellation()
+            (data, resp) = try await requestTransport(req)
+            try Task.checkCancellation()
+        } else {
+            (data, resp) = try await URLSession.shared.data(for: req)
+        }
         let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard statusCode == 200 else {
             throw AnisetteError.httpError(statusCode: statusCode, message: "\(endpointName) endpoint returned HTTP \(statusCode)")
