@@ -25,11 +25,12 @@ extension AnisetteDataProvider {
             throw AnisetteError.loaderFailed(reason: "\(providerName) loader returned nil (code: \(code))")
         }
         var dict = try parseJSONString(String(cString: ptr))
+        let constructorFault = dict.removeValue(forKey: "v3_constructor_fault")
         let temporaryTrace = dict.removeValue(forKey: "v3_native_trace")
         let consumptionTrace = dict.removeValue(forKey: "v3_native_consumption")
         LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace"))
         if let err = dict["error"] {
-            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace) + TemporaryADIConsumptionTrace.suffix(consumptionTrace))
+            throw AnisetteError.adiError(code: code, description: err + TemporaryConstructorFaultTrace.suffix(constructorFault) + TemporaryAnisetteNativeTrace.suffix(temporaryTrace) + TemporaryADIConsumptionTrace.suffix(consumptionTrace))
         }
         return try AnisetteDataResponse(from: dict)
     }
@@ -42,10 +43,11 @@ extension AnisetteDataProvider {
         guard var dict = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
             throw AnisetteError.invalidResponse(reason: "Bad JSON from start_provision")
         }
+        let constructorFault = dict.removeValue(forKey: "v3_constructor_fault") as? String
         let temporaryTrace = dict.removeValue(forKey: "v3_native_trace") as? String
         LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace") as? String)
         if let err = dict["error"] as? String {
-            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
+            throw AnisetteError.adiError(code: code, description: err + TemporaryConstructorFaultTrace.suffix(constructorFault) + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
         }
         guard let cpimBase64 = dict["cpim_base64"] as? String,
               let cpim = Data(base64Encoded: cpimBase64),
@@ -61,10 +63,11 @@ extension AnisetteDataProvider {
             throw AnisetteError.loaderFailed(reason: "\(providerName) loader returned nil (code: \(code))")
         }
         var dict = try parseJSONString(String(cString: ptr))
+        let constructorFault = dict.removeValue(forKey: "v3_constructor_fault")
         let temporaryTrace = dict.removeValue(forKey: "v3_native_trace")
         LoginDiagnosticTrace.current?.appendNativeTiming(dict.removeValue(forKey: "v3_login_native_trace"))
         if let err = dict["error"] {
-            throw AnisetteError.adiError(code: code, description: err + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
+            throw AnisetteError.adiError(code: code, description: err + TemporaryConstructorFaultTrace.suffix(constructorFault) + TemporaryAnisetteNativeTrace.suffix(temporaryTrace))
         }
         guard let adiPbBase64 = dict["adi_pb_base64"], let adiPb = Data(base64Encoded: adiPbBase64) else {
             throw AnisetteError.invalidResponse(reason: "Missing/invalid adi_pb_base64")
@@ -258,5 +261,35 @@ private enum TemporaryADIConsumptionTrace {
                   (-1...32).contains(fields[7]) else { return "" }
         }
         return " [DEBUG_TEMPORARY_ADI_CONSUMPTION:\(value)]"
+    }
+}
+
+// Independent optional wire: v1 constructor reason/engine text stays unchanged.
+// This metadata is always removed before returning authentication headers.
+private enum TemporaryConstructorFaultTrace {
+    static func suffix(_ value: String?) -> String {
+        guard let value, value.utf8.count < 256,
+              value.utf8.allSatisfy({ $0 < 128 }) else { return "" }
+        let parts = value.split(separator: ";", omittingEmptySubsequences: false)
+        guard parts.count == 10, parts[0] == "v1", parts[1] == "p0_fault_diag1" else { return "" }
+        let fields = Array(parts[2...7])
+        let numbers = fields.compactMap { Int64($0) }
+        guard numbers.count == 6,
+              zip(fields, numbers).allSatisfy({ String($0.1) == String($0.0) }),
+              (0...3).contains(numbers[0]),
+              numbers[1] == -1 || (1...256).contains(numbers[1]),
+              (0...7).contains(numbers[2]),
+              numbers[3] == -1 || (0...65535).contains(numbers[3]),
+              numbers[4] == -1 || (0...805306367).contains(numbers[4]),
+              (0...2).contains(numbers[5]),
+              (numbers[3] == -1) == (numbers[4] == -1),
+              numbers[0] != 0 || (numbers[1] == -1 && numbers[2] == 0),
+              numbers[1] != -1 || numbers[2] == 0 else { return "" }
+        for digest in parts[8...9] {
+            guard digest == "-" || (digest.utf8.count == 64 && digest.utf8.allSatisfy({
+                (48...57).contains($0) || (97...102).contains($0)
+            })) else { return "" }
+        }
+        return " [DEBUG_TEMPORARY_CONSTRUCTOR_FAULT:\(value)]"
     }
 }

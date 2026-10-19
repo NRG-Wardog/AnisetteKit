@@ -10,6 +10,8 @@
 #include "elf_loader_emulator.h"
 #include "android_tls_runtime.h"
 #include "cxx_allocation_runtime.h"
+#include "bounded_asset_digest.h"
+#include "bounded_fault_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -145,6 +147,19 @@ static bool hook_mem_invalid(uc_engine *uc, uc_mem_type type,
     return false;
 }
 
+// Observation only. No engine calls, allocation, mapping, protection or retry.
+static bool hook_mem_protection(uc_engine *, uc_mem_type type, uint64_t address,
+                                int size, int64_t, void *user_data) noexcept {
+    using bounded_fault_diagnostics::Access;
+    auto *vm = static_cast<EmulatorVM *>(user_data);
+    Access access = Access::Unknown;
+    if (type == UC_MEM_READ_PROT) access = Access::ReadProtection;
+    else if (type == UC_MEM_WRITE_PROT) access = Access::WriteProtection;
+    else if (type == UC_MEM_FETCH_PROT) access = Access::FetchProtection;
+    if (vm) vm->protection_fault.record(access, address, size);
+    return false;
+}
+
 uint64_t PageAllocator::alloc(uint64_t bytes) {
     // Reject before any arithmetic or mutation; guest exhaustion must not abort
     // the host process. Callers treat zero as a failed reservation.
@@ -198,6 +213,10 @@ EmulatorVM::EmulatorVM(bool checked)
     check(uc_mem_write(uc, errno_addr, &zero, sizeof(zero)));
 
     check(uc_hook_add(uc, &invalid_hook, UC_HOOK_MEM_UNMAPPED, (void *)hook_mem_invalid, this, 1, 0));
+
+    check(uc_hook_add(uc, &protection_hook,
+        UC_HOOK_MEM_READ_PROT | UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_FETCH_PROT,
+        (void *)hook_mem_protection, this, 1, 0));
 
     // Each engine owns one Bionic TLS stack guard. Never reuse device identity
     // data as entropy, and never initialize this per procedure/constructor.
@@ -1336,6 +1355,7 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
         file.reset();
 
         EmulatorVM::LibraryInfo lib{};
+        lib.asset_digest = bounded_fault_diagnostics::loaded_buffer_digest(buffer.data(), buffer.size());
         const char *error = nullptr;
         if (!elf_metadata_bounds::parse(buffer.data(), buffer.size(), lib.metadata, error)) return fail(error);
         lib.name = so_name;
@@ -1422,10 +1442,11 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
         if (failure) failure->reason = vm && vm->initialization_failed ? Reason::PreviouslyFailed : Reason::InvalidVM;
         return false;
     }
-    auto failed = [&](Kind kind, Reason reason, int engine, size_t library, size_t initializer) {
-        // Snapshot the first failure before poisoning the VM. No diagnostic
-        // state is retained by the VM or shared between calls.
-        if (failure) *failure = {kind, reason, engine, ordinal(library), ordinal(initializer)};
+    auto failed = [&](Kind kind, Reason reason, int engine, size_t library, size_t initializer,
+                      bounded_fault_diagnostics::Snapshot fault = {}) {
+        // Snapshot the first failure before poisoning the VM. No raw pending
+        // address escapes into the returned snapshot.
+        if (failure) *failure = {kind, reason, engine, ordinal(library), ordinal(initializer), fault};
         vm->initialization_failed = true;
         return false;
     };
@@ -1437,7 +1458,7 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
             bool completed = false;
             ProcedureFailure execution;
             run_vm_procedure(vm, lib.init_func, {}, 0, 0, &completed, &execution);
-            if (!completed) return failed(Kind::DTInit, execution.reason, execution.engine, library, 0);
+            if (!completed) return failed(Kind::DTInit, execution.reason, execution.engine, library, 0, execution.fault);
         }
         if (lib.init_array && lib.init_arraysz) {
             size_t count = lib.init_arraysz / 8;
@@ -1452,7 +1473,7 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
                     bool completed = false;
                     ProcedureFailure execution;
                     run_vm_procedure(vm, ctor_ptr, {}, 0, 0, &completed, &execution);
-                    if (!completed) return failed(Kind::DTInitArray, execution.reason, execution.engine, library, i);
+                    if (!completed) return failed(Kind::DTInitArray, execution.reason, execution.engine, library, i, execution.fault);
                 }
             }
         }
@@ -1472,6 +1493,7 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
     using namespace vm_initialization_diagnostics;
     if (execution_completed) *execution_completed = false;
     if (failure) *failure = {};
+    if (vm) vm->protection_fault.reset();
     if (!vm || !vm->uc || vm->initialization_failed || !proc_addr) {
         if (failure) failure->reason = vm && vm->initialization_failed ? Reason::PreviouslyFailed : Reason::InvalidVM;
         return -1;
@@ -1539,6 +1561,8 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
                 (err != UC_ERR_OK ? Reason::EngineError : Reason::UnexpectedReturn);
             // Report the real API status, not the synthetic return encoding or W0.
             failure->engine = static_cast<int>(vm->unsupported_interrupt ? engine_status : err);
+            // Diagnostics cannot replace the original engine/read status.
+            failure->fault = bounded_fault_runtime::snapshot(vm, pc_status == UC_ERR_OK, pc);
         }
         LOG_UC("[Emulator] Execution stopped with status %d: %s at PC=0x%llx (expected 0x%llx)\n",
                (int)err, uc_strerror(err), (unsigned long long)pc, (unsigned long long)kReturnAddress);

@@ -9,6 +9,7 @@ a=p.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=True)
 repo=Path(__file__).resolve().parents[2]
 files=[repo/name for name in ['Native/Loader/elf_loader_emulator.cpp','Native/Loader/elf_loader_emulator.h','Native/Loader/elf_metadata_bounds.h','Native/Loader/android_tls_runtime.h','Native/Loader/cxx_allocation_runtime.h','Native/Loader/adi_consumption_debug.h','Native/anisette_base.h','Native/include/anisette_core.h','.ci/native-tests/fixtures/memory_boundaries_host.cpp','.ci/native-tests/test_memory_boundaries_host.py']]
 def hashes():return {str(f.relative_to(repo)):hashlib.sha256(f.read_bytes()).hexdigest() for f in files}
+files += [repo / 'Native/Loader' / name for name in ('bounded_fault_diagnostics.h','bounded_fault_runtime.h','bounded_asset_digest.h','vm_initialization_diagnostics.h')]
 before=hashes();rows=[]
 for variant,flags in [('normal',[]),('optimized',['-O2','-DNDEBUG']),('sanitized',['-O1','-g','-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer'])]:
  binary=out/('memory-'+variant)

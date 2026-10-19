@@ -76,6 +76,7 @@ public:
 struct EmulatorVM {
     struct LibraryInfo {
         std::string name;
+        bounded_fault_diagnostics::Digest asset_digest;
         elf_metadata_bounds::Metadata metadata;
         uint64_t base_address;
         uint64_t min_vaddr;
@@ -115,6 +116,8 @@ struct EmulatorVM {
 
     uint64_t errno_addr;
     uc_hook invalid_hook = 0;
+    uc_hook protection_hook = 0;
+    bounded_fault_diagnostics::Pending protection_fault;
     uc_hook import_hook = 0;
     uc_hook pc_trace_hook = 0;
 

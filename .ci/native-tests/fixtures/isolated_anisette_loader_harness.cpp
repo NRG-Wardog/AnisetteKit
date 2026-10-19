@@ -66,6 +66,8 @@ uc_err uc_emu_start(uc_engine *uc,uint64_t begin,uint64_t end,uint64_t timeout,s
 }
 const char *uc_strerror(uc_err) { return "synthetic"; }
 uc_err uc_emu_stop(uc_engine *) { return UC_ERR_OK; }
+uc_err uc_mem_regions(uc_engine *,uc_mem_region **out,uint32_t *count){*out=nullptr;*count=0;return 1;}
+uc_err uc_free(void *p){std::free(p);return UC_ERR_OK;}
 static void hook_mem_invalid(){}
 static void hook_intr(){}
 static void import_callback_router(){}

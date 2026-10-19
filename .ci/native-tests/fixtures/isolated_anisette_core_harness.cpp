@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -94,6 +95,12 @@ static int injected_fgetc(FILE *f) { if(hit("extra"))return 'X';return ::fgetc(f
 static int injected_ferror(FILE *f) { if(hit("readerror"))return 1;return ::ferror(f); }
 static char *injected_strdup(const char *p) { if(hit("alloc"))return nullptr;return ::strdup(p); }
 
+static bool fail_diagnostic_malloc = false;
+static void *injected_malloc(size_t size) {
+    if (fail_diagnostic_malloc) { fail_diagnostic_malloc = false; return nullptr; }
+    return std::malloc(size);
+}
+#define malloc injected_malloc
 #define mkdir injected_mkdir
 #define mkdirat injected_mkdirat
 #define open injected_open
@@ -112,6 +119,7 @@ static char *injected_strdup(const char *p) { if(hit("alloc"))return nullptr;ret
 #define strdup injected_strdup
 #define format_uuid_string injected_format_uuid_string
 #include "anisette_core_uc.cpp"
+#undef malloc
 #undef mkdir
 #undef mkdirat
 #undef open
@@ -183,7 +191,15 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
     ++library_constructors;observe_native_checkpoint("library.constructors");
     if (fault == "constructor_diag") {
         using namespace vm_initialization_diagnostics;
-        if (failure) *failure = {Kind::DTInitArray, Reason::EngineError, 13, 1, 2};
+        if (failure) {
+            *failure = {Kind::DTInitArray, Reason::EngineError, 13, 1, 2};
+            failure->fault.available = true;
+            failure->fault.access = bounded_fault_diagnostics::Access::ReadProtection;
+            failure->fault.width = 8;
+            failure->fault.region = bounded_fault_diagnostics::Region::LowGuard;
+            failure->fault.pc_library = 1; failure->fault.pc_offset = 32;
+            failure->fault.guard = bounded_fault_diagnostics::Guard::Intact;
+        }
         vm->initialization_failed = true;
         return false;
     }
@@ -269,6 +285,23 @@ static std::string native_trace(const char *json) {
 }
 
 int main(int argc,char **argv) {
+#if V3_TEMPORARY_ANISETTE_TRACE_ENABLED
+    // Optional metadata allocation failure preserves the original error JSON.
+    char *preserved = strdup("{\"error\":\"engine13\"}");
+    char *original = preserved;
+    {
+        NativeOTPTrace trace(&preserved);
+        trace.add(NativeOTPStage::LibraryInitFailed);
+        vm_initialization_diagnostics::ConstructorFailure f{
+            vm_initialization_diagnostics::Kind::DTInit,
+            vm_initialization_diagnostics::Reason::EngineError,13,0,0};
+        f.fault.available = true;
+        trace.record_constructor_fault(f);
+        fail_diagnostic_malloc = true;
+    }
+    assert(!fail_diagnostic_malloc && preserved == original && strcmp(preserved,"{\"error\":\"engine13\"}")==0);
+    free_c_string(preserved);
+#endif
     assert(argc==2);fault=argv[1];
     if(fault.rfind("normal_",0)==0) { normal_mode=true;require_bounded=false;fault=fault.substr(7); }
     anisetteCoreSetLogging(1);
@@ -311,6 +344,9 @@ int main(int argc,char **argv) {
 #if V3_TEMPORARY_ANISETTE_TRACE_ENABLED
         assert(trace.find("vm.init.ok,library.load.ok,library.init.failed,setup.failed")!=std::string::npos);
         assert(trace.find("cleanup.not_requested")!=std::string::npos);
+        assert(first.find("\"v3_constructor_fault\":\"v1;p0_fault_diag1;1;8;1;1;32;1;-;-\"")!=std::string::npos);
+#else
+        assert(first.find("v3_constructor_fault")==std::string::npos);
 #endif
         assert(first.find("v2|0|0|0")!=std::string::npos);
         assert(first.find(expected_blob)==std::string::npos && first.find(expected_uuid)==std::string::npos);
@@ -323,6 +359,7 @@ int main(int argc,char **argv) {
         assert(invoke()==ANISETTE_ERR_LOADER_FAILED && json);
         assert(strstr(json,"VM initialization previously failed; restart required"));
         assert(!strstr(json,"Library constructor execution failed"));
+        assert(!strstr(json,"v3_constructor_fault"));
         assert(library_constructors==1 && normal_procedures.empty() && otp_calls==0 && provision_calls==0);
         assert(first.find("reason=engine_error;engine=13;library=1;initializer=2")!=std::string::npos);
         assert(contents(directory+"/adi.pb")==expected_blob);

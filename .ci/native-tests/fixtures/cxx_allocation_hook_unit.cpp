@@ -19,6 +19,8 @@ uc_err uc_mem_read(uc_engine *e,uint64_t a,void *p,uint64_t n){for(uint64_t i=0;
 uc_err uc_reg_read(uc_engine *e,int r,void *p){if(bad_read)return UC_ERR_ARG;memcpy(p,e->regs[r].data(),width(r));return UC_ERR_OK;}
 uc_err uc_reg_write(uc_engine *e,int r,const void *p){if(bad_write)return UC_ERR_ARG;memcpy(e->regs[r].data(),p,width(r));return UC_ERR_OK;}
 uc_err uc_hook_add(uc_engine*,uc_hook*,int,void*,void*,uint64_t,uint64_t,...){return UC_ERR_OK;}
+uc_err uc_mem_regions(uc_engine *,uc_mem_region **out,uint32_t *count){*out=nullptr;*count=0;return UC_ERR_NOMEM;}
+uc_err uc_free(void *p){std::free(p);return UC_ERR_OK;}
 uc_err uc_emu_stop(uc_engine*){++stops;return UC_ERR_OK;}
 uc_err uc_emu_start(uc_engine *e,uint64_t,uint64_t end,uint64_t,size_t){
  // API outcome injection only: no guest bytes read/interpreted/executed.

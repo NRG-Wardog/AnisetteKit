@@ -92,7 +92,7 @@ def main():
     sources = [root / 'Native/Loader/elf_loader_emulator.cpp',
                root / '.ci/native-tests/fixtures/constructor_diagnostics.cpp']
     evidence = sources + [root / '.ci/native-tests/test_constructor_diagnostics.py'] + [root / 'Native/Loader' / name for name in
-                          ('cxx_allocation_runtime.h', 'elf_loader_emulator.h', 'elf_metadata_bounds.h', 'android_tls_runtime.h', 'vm_initialization_diagnostics.h')]
+                          ('bounded_fault_diagnostics.h', 'bounded_fault_runtime.h', 'bounded_asset_digest.h', 'cxx_allocation_runtime.h', 'elf_loader_emulator.h', 'elf_metadata_bounds.h', 'android_tls_runtime.h', 'vm_initialization_diagnostics.h')]
     if not all(path.is_file() for path in evidence):
         parser.error('Production sources or fixture missing')
     environment = os.environ.copy()

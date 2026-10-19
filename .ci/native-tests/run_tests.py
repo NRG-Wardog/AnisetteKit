@@ -83,6 +83,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
         (cls.build / 'Loader').mkdir()
         shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', cls.build / 'Loader/adi_consumption_debug.h')
         shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', cls.build / 'Loader/vm_initialization_diagnostics.h')
+        shutil.copyfile(ROOT / 'Native/Loader/bounded_fault_diagnostics.h', cls.build / 'Loader/bounded_fault_diagnostics.h')
         (cls.build / 'Loader/elf_loader_emulator.h').write_text(
             (HERE / 'fixtures/isolated_anisette_vm_double.h').read_text())
         for name in ('Native/anisette_base.h', 'Native/anisette_base.cpp',
@@ -226,7 +227,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
     def test_actual_loader_lifetime_and_read_only_callbacks(self):
         compiler = shutil.which('c++') or shutil.which('g++')
         loader = source('Native/Loader/elf_loader_emulator.cpp')
-        signatures = ['uint64_t PageAllocator::alloc(', 'EmulatorVM::EmulatorVM(',
+        signatures = ['static bool hook_mem_protection(', 'uint64_t PageAllocator::alloc(', 'EmulatorVM::EmulatorVM(',
                       'EmulatorVM::~EmulatorVM()', 'static void fail_guest_operation(',
                       'static bool checked_guest_read(', 'static bool checked_guest_write(',
                       'static bool checked_register_read(', 'static bool checked_register_write(',
@@ -244,17 +245,20 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             (build / 'Loader/elf_loader_emulator.h').write_text(source('Native/Loader/elf_loader_emulator.h'))
             shutil.copyfile(ROOT / 'Native/Loader/elf_metadata_bounds.h', build / 'Loader/elf_metadata_bounds.h')
             shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', build / 'Loader/vm_initialization_diagnostics.h')
+            for header in ('bounded_fault_diagnostics.h', 'bounded_fault_runtime.h', 'bounded_asset_digest.h'):
+                shutil.copyfile(ROOT / 'Native/Loader' / header, build / 'Loader' / header)
             shutil.copyfile(ROOT / 'Native/Loader/android_tls_runtime.h', build / 'android_tls_runtime.h')
             for path in ('Native/anisette_base.h', 'Native/include/anisette_core.h', 'Native/anisette_base.cpp'):
                 (build / Path(path).name).write_text(source(path))
-            constants = sorted(set(re.findall(r'\bUC_[A-Z0-9_]+\b', functions + source('Native/Loader/android_tls_runtime.h'))))
+            constants = sorted(set(re.findall(r'\bUC_[A-Z0-9_]+\b', functions + source('Native/Loader/android_tls_runtime.h') + source('Native/Loader/bounded_fault_runtime.h'))))
             # SIMD register constants must form the real contiguous range.
             constants = [x for x in constants if not x.startswith('UC_ARM64_REG_V')]
             constants += ['UC_ARM64_REG_V' + str(n) for n in range(32)]
             constants.remove('UC_ERR_OK')
-            header = '#pragma once\n#include <cstdint>\n#include <cstddef>\nstruct uc_engine;\nusing uc_err=int;using uc_hook=uint64_t;\n'
+            header = '#pragma once\n#include <cstdint>\n#include <cstddef>\nstruct uc_engine;\nusing uc_err=int;using uc_hook=uint64_t;using uc_mem_type=int;\nstruct uc_mem_region {uint64_t begin,end;uint32_t perms;};\n'
             header += 'enum { UC_ERR_OK=0, ' + ', '.join(constants) + ' };\n'
             header += '''uc_err uc_open(int,int,uc_engine**);uc_err uc_close(uc_engine*);
+uc_err uc_mem_regions(uc_engine*,uc_mem_region**,uint32_t*);uc_err uc_free(void*);
 uc_err uc_mem_map(uc_engine*,uint64_t,size_t,int);
 uc_err uc_mem_unmap(uc_engine*,uint64_t,size_t);
 uc_err uc_mem_write(uc_engine*,uint64_t,const void*,size_t);
@@ -268,7 +272,7 @@ const char* uc_strerror(uc_err);
             (build / 'unicorn/unicorn.h').write_text(header)
             (build / 'unicorn/arm64.h').write_text('#include "unicorn.h"\n')
             shutil.copyfile(ROOT / 'Native/Loader/adi_consumption_debug.h', build / 'adi_consumption_debug.h')
-            (build / 'loader_functions.inc').write_text('#include "adi_consumption_debug.h"\n#include "android_tls_runtime.h"\n' + functions)
+            (build / 'loader_functions.inc').write_text('#include "adi_consumption_debug.h"\n#include "android_tls_runtime.h"\n#include "Loader/bounded_fault_runtime.h"\n#include "Loader/bounded_asset_digest.h"\n' + functions)
             (build / 'main.cpp').write_text((HERE / 'fixtures/isolated_anisette_loader_harness.cpp').read_text())
             binary = build / 'loader-test'
             compiled = subprocess.run([compiler, '-std=c++17', '-I', str(build), str(build / 'main.cpp'),

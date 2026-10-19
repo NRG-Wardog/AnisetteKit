@@ -21,6 +21,7 @@ source = ROOT / '.ci/native-tests/fixtures/cxx_allocation_unit.cpp'
 hook_source = ROOT / '.ci/native-tests/fixtures/cxx_allocation_hook_unit.cpp'
 includes = [ROOT/'Native/Loader', ROOT/'Native', ROOT/'Native/include', a.unicorn_include]
 evidence = [loader, source, hook_source, ROOT/"Native/Loader/cxx_allocation_runtime.h", ROOT/"Native/Loader/elf_loader_emulator.h", ROOT/"Native/Loader/elf_metadata_bounds.h", ROOT/"Native/Loader/android_tls_runtime.h", ROOT/"Native/Loader/vm_initialization_diagnostics.h", ROOT/"Native/Loader/adi_consumption_debug.h", ROOT/"Native/anisette_base.h", ROOT/"Native/include/anisette_core.h", Path(__file__).resolve()]
+evidence += [ROOT / 'Native/Loader' / name for name in ('bounded_fault_diagnostics.h','bounded_fault_runtime.h','bounded_asset_digest.h')]
 before = {str(f.relative_to(ROOT)):hashlib.sha256(f.read_bytes()).hexdigest() for f in evidence}
 results = {}
 for variant, flags in [('normal', []), ('optimized', ['-O2','-DNDEBUG']), ('sanitized', ['-O1','-g','-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer'])]:

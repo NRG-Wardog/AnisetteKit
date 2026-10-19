@@ -4,9 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include "bounded_fault_diagnostics.h"
 
-// Caller-owned observations only. No addresses, registers, guest strings,
-// identities, file names or arbitrary error text may enter this wire format.
+// Caller-owned observations only. The legacy description is unchanged. The
+// separate fault snapshot permits a bounded relative PC, never raw addresses,
+// registers, guest strings, identities, filenames or arbitrary error text.
 namespace vm_initialization_diagnostics {
 enum class Kind { Unknown, DTInit, DTInitArray, ArrayEntryRead };
 enum class Reason {
@@ -16,6 +18,7 @@ enum class Reason {
 struct ProcedureFailure {
     Reason reason = Reason::Unknown;
     int engine = -1;
+    bounded_fault_diagnostics::Snapshot fault;
 };
 struct ConstructorFailure {
     Kind kind = Kind::Unknown;
@@ -23,6 +26,7 @@ struct ConstructorFailure {
     int engine = -1;
     int library = -1;
     int initializer = -1;
+    bounded_fault_diagnostics::Snapshot fault;
 };
 inline int ordinal(size_t value) noexcept { return value <= 65535 ? static_cast<int>(value) : -1; }
 inline int bounded(int value, int maximum) noexcept { return value >= 0 && value <= maximum ? value : -1; }
@@ -52,6 +56,7 @@ inline ConstructorFailure normalized(ConstructorFailure value) noexcept {
     value.engine = bounded(value.engine, 255);
     value.library = bounded(value.library, 65535);
     value.initializer = bounded(value.initializer, 65535);
+    value.fault = bounded_fault_diagnostics::normalized(value.fault);
     return value;
 }
 inline std::string description(ConstructorFailure value) {

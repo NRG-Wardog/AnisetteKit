@@ -76,3 +76,9 @@ Provenance: the runtime fault matrices and test doubles were ported from
 NRG-Wardog/sidestore-auto-refresh at
 141776ba6ba38fc04a5e77f68b0cfc4e6c8842ee. The original MIT attribution is in
 NOTICE-NRG-Wardog. Upstream source remains under its original LICENSE.
+
+Separate bounded fault successor: see [BOUNDED_FAULT_DIAGNOSTICS.md](BOUNDED_FAULT_DIAGNOSTICS.md).
+`test_bounded_fault_host.py --unicorn-include HEADERS --output RESULTS` compiles
+only API doubles, with no Unicorn engine. Its optional Apple hashing adapter is
+host-only OpenSSL, never native-linkage evidence. The original constructor v1
+message is unchanged; new metadata is independently versioned and bounded.

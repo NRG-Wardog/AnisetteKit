@@ -72,6 +72,10 @@ struct NativeOTPTrace {
     char value[max_bytes + 1] = {};
     size_t count = 0, length = 0;
     char **output;
+    char constructor_fault[bounded_fault_diagnostics::wire_capacity] = {};
+    void record_constructor_fault(const vm_initialization_diagnostics::ConstructorFailure &failure) noexcept {
+        bounded_fault_diagnostics::encode(vm_initialization_diagnostics::normalized(failure).fault, constructor_fault);
+    }
     using Clock = std::chrono::steady_clock;
     Clock::time_point began = Clock::now();
     char timing[2049] = {};
@@ -145,9 +149,11 @@ struct NativeOTPTrace {
         // This is private metadata, removed by Swift before constructing headers.
         // All trace bytes come from the finite literal table above.
         const char prefix[] = ",\"v3_native_trace\":\"";
+        const char fault_prefix[] = ",\"v3_constructor_fault\":\"";
+        const size_t fault_length = strlen(constructor_fault);
         const char timing_prefix[] = ",\"v3_login_native_trace\":\"v1;";
         char *combined = static_cast<char *>(malloc(original_length + sizeof(prefix) + length +
-            sizeof(timing_prefix) + timing_length + 10));
+            sizeof(timing_prefix) + timing_length + sizeof(fault_prefix) + fault_length + 12));
         if (!combined) return; // Diagnostics must not change the original result.
         memcpy(combined, *output, original_length - 1);
         size_t cursor = original_length - 1;
@@ -159,6 +165,11 @@ struct NativeOTPTrace {
             combined[cursor++] = timing_truncated ? '1' : '0';
             combined[cursor++] = ';';
             memcpy(combined + cursor, timing, timing_length); cursor += timing_length;
+            combined[cursor++] = '"';
+        }
+        if (fault_length) {
+            memcpy(combined + cursor, fault_prefix, sizeof(fault_prefix) - 1); cursor += sizeof(fault_prefix) - 1;
+            memcpy(combined + cursor, constructor_fault, fault_length); cursor += fault_length;
             combined[cursor++] = '"';
         }
         memcpy(combined + cursor, "}", 2);
@@ -526,6 +537,7 @@ static bool setup_vm_and_adi(
         vm_initialization_diagnostics::ConstructorFailure constructor_failure;
         if (!run_library_constructors(vm, &constructor_failure)) {
             out_err = vm_initialization_diagnostics::description(constructor_failure);
+            if (trace) trace->record_constructor_fault(constructor_failure);
             return false;
         }
 
