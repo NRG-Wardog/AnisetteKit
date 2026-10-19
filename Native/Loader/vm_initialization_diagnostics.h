@@ -18,7 +18,7 @@ enum class Reason {
 struct ProcedureFailure {
     Reason reason = Reason::Unknown;
     int engine = -1;
-    bounded_fault_diagnostics::Snapshot fault;
+    bounded_fault_diagnostics::Snapshot fault = {};
 };
 struct ConstructorFailure {
     Kind kind = Kind::Unknown;
@@ -26,7 +26,7 @@ struct ConstructorFailure {
     int engine = -1;
     int library = -1;
     int initializer = -1;
-    bounded_fault_diagnostics::Snapshot fault;
+    bounded_fault_diagnostics::Snapshot fault = {};
 };
 inline int ordinal(size_t value) noexcept { return value <= 65535 ? static_cast<int>(value) : -1; }
 inline int bounded(int value, int maximum) noexcept { return value >= 0 && value <= maximum ? value : -1; }
