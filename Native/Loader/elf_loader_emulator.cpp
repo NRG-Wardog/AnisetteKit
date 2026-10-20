@@ -10,6 +10,7 @@
 #include "elf_loader_emulator.h"
 #include "android_tls_runtime.h"
 #include "cxx_allocation_runtime.h"
+#include "work_queue_abi.h"
 #include "bounded_asset_digest.h"
 #include "bounded_fault_runtime.h"
 #include <stdio.h>
@@ -1143,6 +1144,53 @@ static void hook_android_log_print(EmulatorVM *vm) {
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
 }
 
+// Permit only a complete writable 16-byte result in live guest stack or an
+// actual tracked allocation. Unicorn host writes alone do not enforce guest
+// page permissions. Check those separately before a single bounded write.
+static bool work_queue_result_writable(EmulatorVM *vm, uint64_t output, uint64_t sp) {
+    if ((output & 7) != 0 || output < 0x10000) return false;
+    bool owned = sp >= kStackAddress && sp < kStackAddress + kStackSize &&
+        output >= sp && work_queue_abi::fits(output, kStackAddress, kStackSize);
+    for (const auto &allocation : vm->heap_allocation_sizes)
+        owned = owned || work_queue_abi::fits(output, allocation.first, allocation.second);
+    if (!owned) return false;
+    uc_mem_region *regions = nullptr;
+    uint32_t count = 0;
+    const uc_err status = uc_mem_regions(vm->uc, &regions, &count);
+    bool writable = false;
+    if (status == UC_ERR_OK && regions && count <= 256) {
+        unsigned covering = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &region = regions[i];
+            if (region.begin <= output && region.end >= output &&
+                region.end - output >= 15) {
+                ++covering;
+                writable = (region.perms & UC_PROT_WRITE) != 0;
+            }
+        }
+        writable = writable && covering == 1;
+    }
+    if (regions) uc_free(regions);
+    return writable;
+}
+
+static void hook_empty_work_queue(EmulatorVM *vm) {
+    uint64_t output = 0, sp = 0, type = 0;
+    if (!checked_register_read(vm, UC_ARM64_REG_X8, &output) ||
+        !checked_register_read(vm, UC_ARM64_REG_SP, &sp) ||
+        !checked_register_read(vm, UC_ARM64_REG_X1, &type)) return;
+    // Only the observed factory type (W1=0) is admitted. Do not reinterpret
+    // another enum value as an empty functioning queue.
+    if (static_cast<uint32_t>(type) != 0 || !work_queue_result_writable(vm, output, sp)) {
+        LOG_UC("[Emulator] Unsupported WorkQueue factory result or type\n");
+        fail_guest_operation(vm);
+        return;
+    }
+    const uint64_t empty_shared_ptr[2] = {0, 0};
+    // Leave X0, X1, X8, LR and errno unchanged; the return is the X8 object.
+    checked_guest_write(vm, output, empty_shared_ptr, sizeof(empty_shared_ptr));
+}
+
 static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
     (void)size;
     EmulatorVM *vm = (EmulatorVM *)user_data;
@@ -1159,6 +1207,16 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
 
     // Host allocation failures must not unwind through Unicorn's C callback.
     try {
+    const auto media_operation = work_queue_abi::classify(name);
+    if (media_operation == work_queue_abi::Operation::EmptyFactory) {
+        hook_empty_work_queue(vm);
+        return;
+    }
+    if (media_operation == work_queue_abi::Operation::UnsupportedMedia) {
+        LOG_UC("[Emulator] Unsupported mediaplatform import\n");
+        fail_guest_operation(vm);
+        return;
+    }
     const auto cxx_operation = cxx_allocation_runtime::classify(name);
     if (cxx_operation == cxx_allocation_runtime::Operation::New) hook_cxx_new(vm);
     // Matches this VM's existing free semantics: arena lifetime is the VM.
