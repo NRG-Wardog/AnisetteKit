@@ -17,6 +17,10 @@ public enum AnisetteKitLogging {
         lock.withLock { isEnabled }
     }
 
+    /// Changes Swift/native wrapper verbosity only. Unicorn diagnostics are
+    /// separate: set ANISETTEKIT_UNICORN_DIAGNOSTICS=errors before the first VM
+    /// use at application startup. Restart to enable or disable that mode;
+    /// setLogging(false) cannot clear the pinned Unicorn logger's cached mask.
     public static func setLogging(_ enabled: Bool) {
         lock.withLock { isEnabled = enabled }
         anisetteCoreSetLogging(enabled ? 1 : 0)

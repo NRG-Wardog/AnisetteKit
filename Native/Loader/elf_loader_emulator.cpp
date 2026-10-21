@@ -13,6 +13,7 @@
 #include "work_queue_abi.h"
 #include "bounded_asset_digest.h"
 #include "bounded_fault_runtime.h"
+#include "native_logging_policy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -186,6 +187,12 @@ EmulatorVM::EmulatorVM(bool checked)
 {
     // Retain the argument for source compatibility; every VM is checked.
     (void)checked;
+    const auto logging_mode = anisette_native_logging::configure_before_first_vm();
+    if (logging_mode == anisette_native_logging::StartupMode::Failed) {
+        throw std::runtime_error("Native diagnostic startup configuration failed");
+    }
+    LOG_UC("[Emulator] Startup diagnostics=%s; restart required to change Unicorn logging\n",
+           logging_mode == anisette_native_logging::StartupMode::Errors ? "errors-0xC10" : "off");
     uc_err err = uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc);
     if (err != UC_ERR_OK) {
         LOG_UC("[Emulator] Failed on uc_open() with error returned: %u (%s)\n", err, uc_strerror(err));
@@ -674,8 +681,8 @@ static void hook_open(EmulatorVM *vm) {
         activeADIConsumptionDebug->record(ADIConsumptionDebug::Open,category,host_fd >= 0 ? 1 : -1,observed_open_errno);
         if (host_fd >= 0) activeADIConsumptionDebug->track(static_cast<int>(guest_fd),category);
     }
-    LOG_UC("[Hook] open('%s', linux=0x%x, mac=0x%x, mode=0%o) -> fd %lld (errno=%d)\n",
-           path.c_str(), (int)flags, host_flags, (int)mode, (long long)guest_fd, errno);
+    LOG_UC("[Hook] open(path=omitted, linux=0x%x, mac=0x%x, mode=0%o) -> fd %lld (errno=%d)\n",
+           (int)flags, host_flags, (int)mode, (long long)guest_fd, observed_open_errno);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &guest_fd);
 }
 
@@ -815,6 +822,7 @@ static void hook_lstat(EmulatorVM *vm) {
     }
     struct stat host_st;
     int res = lstat(path.c_str(), &host_st);
+    const int observed_lstat_errno = res < 0 ? errno : 0;
     if (res == 0 && stat_buf_ptr != 0) {
         StatLinux linux_st = {0};
         linux_st.st_dev = (uint64_t)host_st.st_dev;
@@ -861,7 +869,7 @@ static void hook_lstat(EmulatorVM *vm) {
         uint32_t err = (uint32_t)errno;
         uc_mem_write(vm->uc, vm->errno_addr, &err, sizeof(err));
     }
-    LOG_UC("[Hook] lstat('%s') -> res %d (errno=%d)\n", path.c_str(), res, errno);
+    LOG_UC("[Hook] lstat(path=omitted) -> res %d (errno=%d)\n", res, observed_lstat_errno);
     int64_t ret = res;
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
 }
@@ -1131,15 +1139,10 @@ static void hook_android_log_print(EmulatorVM *vm) {
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &prio);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &tag_ptr);
     uc_reg_read(vm->uc, UC_ARM64_REG_X2, &fmt_ptr);
-    std::string tag, fmt;
-    char c = 0;
-    if (tag_ptr) {
-        while (uc_mem_read(vm->uc, tag_ptr++, &c, 1) == UC_ERR_OK && c != '\0') tag.push_back(c);
-    }
-    if (fmt_ptr) {
-        while (uc_mem_read(vm->uc, fmt_ptr++, &c, 1) == UC_ERR_OK && c != '\0') fmt.push_back(c);
-    }
-    LOG_UC("[Android Log %lld][%s] %s\n", (long long)prio, tag.c_str(), fmt.c_str());
+    // Guest strings are arbitrary payloads. Do not read, format or capture them.
+    // Retain priority and argument presence, not string contents or addresses.
+    LOG_UC("[Android Log] priority=%lld tag_present=%d format_present=%d text=omitted\n",
+           (long long)prio, tag_ptr != 0, fmt_ptr != 0);
     int64_t ret = 0;
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &ret);
 }
@@ -1386,7 +1389,7 @@ static bool apply_vm_relocations(EmulatorVM *vm, EmulatorVM::LibraryInfo &lib) {
             ++applied;
         }
         LOG_UC("[Emulator] Applied %zu / %zu relocations for %s in '%s'\n",
-               applied, table.size(), label, lib.name.c_str());
+               applied, table.size(), label, anisette_native_logging::library_label(lib.name.c_str()));
         return true;
     };
     return apply_table(lib.metadata.rela, "RELA") && apply_table(lib.metadata.jmprel, "PLT/JMPREL");
@@ -1395,12 +1398,13 @@ static bool apply_vm_relocations(EmulatorVM *vm, EmulatorVM::LibraryInfo &lib) {
 bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std::string &so_name) {
     if (!vm || !vm->uc || vm->initialization_failed) return false;
     auto fail = [&](const char *reason) {
-        LOG_UC("[Emulator] Failed loading '%s': %s\n", so_name.c_str(), reason);
+        LOG_UC("[Emulator] Failed loading '%s': %s\n", anisette_native_logging::library_label(so_name.c_str()), reason);
         vm->initialization_failed = true;
         return false;
     };
     try {
-        LOG_UC("[Emulator] Loading ELF library '%s' from '%s'...\n", so_name.c_str(), file_path.c_str());
+        LOG_UC("[Emulator] Loading ELF library '%s' (path=omitted)...\n",
+               anisette_native_logging::library_label(so_name.c_str()));
         std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(file_path.c_str(), "rb"), fclose);
         if (!file) return fail("file open failed");
         if (fseek(file.get(), 0, SEEK_END) != 0) return fail("file seek failed");
@@ -1512,7 +1516,7 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
         const auto &lib = vm->loaded_libraries[library];
         if (lib.init_func) {
             LOG_UC("[Emulator] Calling DT_INIT at 0x%llx for '%s'...\n",
-                   (unsigned long long)lib.init_func, lib.name.c_str());
+                   (unsigned long long)lib.init_func, anisette_native_logging::library_label(lib.name.c_str()));
             bool completed = false;
             ProcedureFailure execution;
             run_vm_procedure(vm, lib.init_func, {}, 0, 0, &completed, &execution);
@@ -1527,7 +1531,7 @@ bool run_library_constructors(EmulatorVM *vm, vm_initialization_diagnostics::Con
                     return failed(Kind::ArrayEntryRead, Reason::EntryRead, static_cast<int>(read_status), library, i);
                 if (ctor_ptr != 0) {
                     LOG_UC("[Emulator] Calling DT_INIT_ARRAY[%zu] at 0x%llx for '%s'...\n",
-                           i, (unsigned long long)ctor_ptr, lib.name.c_str());
+                           i, (unsigned long long)ctor_ptr, anisette_native_logging::library_label(lib.name.c_str()));
                     bool completed = false;
                     ProcedureFailure execution;
                     run_vm_procedure(vm, ctor_ptr, {}, 0, 0, &completed, &execution);

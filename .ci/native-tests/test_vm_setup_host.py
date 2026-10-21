@@ -12,7 +12,7 @@ a=p.parse_args();root=a.output.resolve();root.mkdir(parents=True,exist_ok=True)
 repo=Path(__file__).resolve().parents[2]
 evidence=[repo / name for name in ['Native/Loader/elf_loader_emulator.cpp','Native/Loader/elf_loader_emulator.h','Native/Loader/elf_metadata_bounds.h','Native/Loader/android_tls_runtime.h','Native/Loader/cxx_allocation_runtime.h','Native/anisette_core_uc.cpp','.ci/native-tests/fixtures/vm_setup_host.cpp','.ci/native-tests/test_vm_setup_host.py']]
 def hashes(): return {str(f.relative_to(repo)):hashlib.sha256(f.read_bytes()).hexdigest() for f in evidence}
-evidence += [repo / 'Native/Loader' / name for name in ('bounded_fault_diagnostics.h','bounded_fault_runtime.h','bounded_asset_digest.h','vm_initialization_diagnostics.h')]
+evidence += [repo / 'Native/Loader' / name for name in ('bounded_fault_diagnostics.h','bounded_fault_runtime.h','bounded_asset_digest.h','vm_initialization_diagnostics.h','native_logging_policy.h')]
 before=hashes()
 source=repo/'Native/Loader/elf_loader_emulator.cpp';core=repo/'Native/anisette_core_uc.cpp';text=core.read_text()
 prefix=text[text.index('static EmulatorVM *g_shared_vm'):text.index('    if (!g_libraries_initialized)',text.index('static bool setup_vm_and_adi'))]

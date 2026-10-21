@@ -549,11 +549,11 @@ static bool setup_vm_and_adi(
         }
 
         uint64_t lib_path_vm = vm->write_string(lib_path.c_str());
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=library.init begin\n");
         adiConsumptionPhase(ADIConsumptionDebug::LibraryInit);
         NativeLoginTimingScope load_call_timing(trace, 14);
         int32_t load_res = run_vm_procedure(vm, load_lib_ptr, {lib_path_vm, 0}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=library.init result=%d\n", (int)load_res);
         if (load_res != 0) {
             out_err = "ADILoadLibraryWithPath failed: " + std::to_string(load_res);
             return false;
@@ -584,10 +584,10 @@ static bool setup_vm_and_adi(
             return false;
         }
         uint64_t prov_path_vm = vm->write_string(out_uuid_prov_dir.c_str());
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=provisioning_path begin\n");
         adiConsumptionPhase(ADIConsumptionDebug::ProvisioningPath);
         int32_t prov_res = run_vm_procedure(vm, set_prov_ptr, {prov_path_vm}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=provisioning_path result=%d\n", (int)prov_res);
         if (prov_res != 0) {
             out_err = "ADISetProvisioningPath failed: " + std::to_string(prov_res);
             return false;
@@ -607,10 +607,10 @@ static bool setup_vm_and_adi(
             return false;
         }
         uint64_t android_id_vm = vm->write_string(android_id.c_str());
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=android_id begin\n");
         adiConsumptionPhase(ADIConsumptionDebug::AndroidID);
         int32_t id_res = run_vm_procedure(vm, set_id_ptr, {android_id_vm, (uint64_t)android_id.length()}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-        LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+        LOG_UC("[AnisetteKit - UC] phase=android_id result=%d\n", (int)id_res);
         if (id_res != 0) {
             out_err = "ADISetAndroidID failed: " + std::to_string(id_res);
             return false;
@@ -699,11 +699,11 @@ static int32_t get_anisette_headers_uc_locked(
     }
 
     uint64_t dsid = (uint64_t)-2;
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=otp begin\n");
     NativeOTPStageScope otp_stage(&trace, NativeOTPStage::NativeOTPFailed);
     adiConsumptionPhase(ADIConsumptionDebug::OTP);
     int32_t res = run_vm_procedure(vm, otp_req_ptr, {dsid, mid_ptr, mid_len_ptr, otp_ptr, otp_len_ptr}, isolated ? 5000000 : 0, isolated ? 50000000 : 0);
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=otp result=%d\n", (int)res);
 
     otp_stage.finish(res == 0 ? NativeOTPStage::NativeOTPOK : NativeOTPStage::NativeOTPFailed);
     if (res != 0) {
@@ -1033,10 +1033,10 @@ int32_t start_provision_uc(
     }
 
     uint64_t dsid = (uint64_t)-2;
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=provisioning.start begin spim_bytes=%u\n", (unsigned)spim_len);
     NativeOTPStageScope operation_stage(&trace, NativeOTPStage::NativeStartFailed);
     int32_t res = run_vm_procedure(vm, prov_start_ptr, {dsid, spim_vm, (uint64_t)spim_len, cpim_ptr, cpim_len_ptr, session_ptr});
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=provisioning.start result=%d\n", (int)res);
 
     if (res != 0) {
         rmdir(uuid_prov_dir.c_str());
@@ -1056,7 +1056,7 @@ int32_t start_provision_uc(
     uc_mem_read(vm->uc, cpim_len_ptr, &final_cpim_len, 4);
     uc_mem_read(vm->uc, session_ptr, &session, 4);
 
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=provisioning.start output_present=%d cpim_bytes=%u\n", final_cpim_addr != 0, (unsigned)final_cpim_len);
     fflush(stdout);
 
     std::vector<uint8_t> cpim_data(final_cpim_len);
@@ -1116,10 +1116,10 @@ int32_t end_provision_uc(
     uint64_t ptm_vm = vm->write_bytes(ptm, ptm_len);
     uint64_t tk_vm  = vm->write_bytes(tk, tk_len);
 
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=provisioning.end begin ptm_bytes=%u tk_bytes=%u\n", (unsigned)ptm_len, (unsigned)tk_len);
     NativeOTPStageScope operation_stage(&trace, NativeOTPStage::NativeEndFailed);
     int32_t res = run_vm_procedure(vm, prov_end_ptr, {(uint64_t)session, ptm_vm, (uint64_t)ptm_len, tk_vm, (uint64_t)tk_len});
-    LOG_UC("[AnisetteKit - UC] Native operation progress.\n");
+    LOG_UC("[AnisetteKit - UC] phase=provisioning.end result=%d\n", (int)res);
 
     if (res != 0) {
         std::stringstream ss;
