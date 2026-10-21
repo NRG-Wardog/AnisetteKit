@@ -12,6 +12,19 @@ import FoundationNetworking
 #endif
 import anisette_core
 
+public enum AnisetteProvisioningHeaderPolicy: Sendable {
+    case standard
+    case windowsV3
+
+    func apply(to headers: [String: String]) -> [String: String] {
+        guard case .windowsV3 = self else { return headers }
+        var filtered = headers
+        filtered.removeValue(forKey: AnisetteConstants.Headers.routingInfo)
+        filtered.removeValue(forKey: AnisetteConstants.Headers.serialNumber)
+        return filtered
+    }
+}
+
 public enum ProvisioningStorage: Equatable, Sendable {
     case disk
     case memory(existingBlob: Data? = nil)
@@ -49,6 +62,9 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
     public let lookupURL: URL
     public let requiredLibraries: [String]
     public let provider: any AnisetteDataProvider
+    private let provisioningHeaderPolicy: AnisetteProvisioningHeaderPolicy
+    private let requestSession: URLSession
+    private let provisioningURLValidator: (@Sendable (URL, String) -> Bool)?
 
     let routingInfoLock = NSLock()
     var routingInfoCache = [UUID: String]()
@@ -60,7 +76,10 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         lookupURL: URL = AnisetteConstants.URLs.grandSlamLookup,
         requiredLibraries: [String] = AnisetteConstants.Libraries.requiredNames,
         provider: (any AnisetteDataProvider)? = nil,
-        libraryDirectoryResolver: LibraryDirectoryResolver? = nil
+        libraryDirectoryResolver: LibraryDirectoryResolver? = nil,
+        requestSession: URLSession = .shared,
+        provisioningURLValidator: (@Sendable (URL, String) -> Bool)? = nil,
+        provisioningHeaderPolicy: AnisetteProvisioningHeaderPolicy = .standard
     ) throws {
         let diagnosticSpan = LoginDiagnosticTrace.current?.begin(.clientInitialization)
         do {
@@ -69,6 +88,9 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         self.userAgent = userAgent
         self.lookupURL = lookupURL
         self.requiredLibraries = requiredLibraries
+        self.provisioningHeaderPolicy = provisioningHeaderPolicy
+        self.requestSession = requestSession
+        self.provisioningURLValidator = provisioningURLValidator
 
         let resolvedProvider: any AnisetteDataProvider = provider ?? {
             #if os(macOS)
@@ -344,7 +366,10 @@ extension AnisetteClient {
     }
 
     private func sendRequest(_ req: URLRequest, step: String, endpointName: String) async throws -> (data: Data, response: URLResponse) {
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let validate = provisioningURLValidator, !validate(req.url ?? lookupURL, step) {
+            throw AnisetteError.invalidResponse(reason: "Unexpected provisioning destination")
+        }
+        let (data, resp) = try await requestSession.data(for: req)
         let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard statusCode == 200 else {
             throw AnisetteError.httpError(statusCode: statusCode, message: "\(endpointName) endpoint returned HTTP \(statusCode)")
@@ -372,7 +397,7 @@ extension AnisetteClient {
                 if customHeaders?.userAgent == nil { $0.userAgent = self.userAgent }
             }
 
-        let dict = AnisetteHeadersDTO.toDictionary(from: headers)
+        let dict = provisioningHeaderPolicy.apply(to: AnisetteHeadersDTO.toDictionary(from: headers))
         for (k, v) in dict {
             req.setValue(v, forHTTPHeaderField: k)
         }
