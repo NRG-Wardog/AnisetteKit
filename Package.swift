@@ -13,8 +13,8 @@ import PackageDescription
 let unicornBinaryTargets: [Target] = [
     .binaryTarget(
         name: "Unicorn",
-        url: "https://github.com/mahee96/unicorn/releases/download/2.1.4-multiarch/Unicorn.xcframework.zip#AnisetteKit",
-        checksum: "4f61907db6aafc56fb3e336b524d742342312f498bb40739f1da55fb4a24614a"
+        url: "https://github.com/mahee96/unicorn/releases/download/2.1.4-xcf-a53ddc9/Unicorn.xcframework.zip#AnisetteKit",
+        checksum: "52e4ac9e2d704c4941adc2c381df8706aabf673dc843611a90b33ad349d562db"
     )
 ]
 let unicornCoreDependencies: [Target.Dependency] = [
