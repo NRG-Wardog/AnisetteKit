@@ -82,7 +82,7 @@ jobs:
           source=pathlib.Path('Tests/AnisetteKitTests/OwnedOnDeviceAnisetteAttemptTests.swift').read_text()
           tests=re.findall(r'^    func (test\w+)\(',source,re.M)
           log=pathlib.Path('evidence/swift-tests.log').read_text()
-          assert len(tests)==7, 'Owned test inventory changed without review'
+          assert len(tests)==8, 'Owned test inventory changed without review'
           for test in tests:
               assert re.search(r'^Test Case .*'+re.escape(test)+r'(?![A-Za-z0-9_]).* passed \(',log,re.M), 'Missing passed XCTest: '+test
           PYCODE

@@ -15,6 +15,8 @@ public final class OwnedOnDeviceAnisetteAttempt: @unchecked Sendable {
     private let identifier: UUID
     private let lock = NSLock()
     private var started = false
+    private var cancelled = false
+    private let beforeResultReturn: (@Sendable () async -> Void)?
 
     public convenience init(libraryDirectory: URL, verifiedLibraries: [String: Data], scratchParent: URL, identifier: UUID,
                 budgetMilliseconds: UInt32 = 60_000) async throws {
@@ -26,7 +28,8 @@ public final class OwnedOnDeviceAnisetteAttempt: @unchecked Sendable {
     // Internal URLProtocol fixture seam. The attempt still constructs and owns
     // its session; no borrowed session or ambient/global transport is admitted.
     init(libraryDirectory: URL, verifiedLibraries: [String: Data], scratchParent: URL, identifier: UUID,
-         budgetMilliseconds: UInt32 = 60_000, transportConfiguration: URLSessionConfiguration) async throws {
+         budgetMilliseconds: UInt32 = 60_000, transportConfiguration: URLSessionConfiguration,
+         beforeResultReturn: (@Sendable () async -> Void)? = nil) async throws {
         guard libraryDirectory.isFileURL, scratchParent.isFileURL,
               budgetMilliseconds > 0, budgetMilliseconds <= 120_000 else { throw AnisetteError.invalidArgument }
         let library = libraryDirectory.resolvingSymlinksInPath().standardizedFileURL
@@ -51,9 +54,28 @@ public final class OwnedOnDeviceAnisetteAttempt: @unchecked Sendable {
             throw error
         }
         self.provider = provider; self.session = session; self.identifier = identifier
+        self.beforeResultReturn = beforeResultReturn
     }
 
-    public func cancel() { provider.cancel(); session.invalidateAndCancel() }
+    public func cancel() {
+        lock.withLock { cancelled = true }
+        provider.cancel(); session.invalidateAndCancel()
+    }
+    private func checkCancellation() throws {
+        try Task.checkCancellation()
+        if lock.withLock({ cancelled }) { throw CancellationError() }
+    }
+    // The production return boundary is also exercised with synthetic completed
+    // values by fixtures, without pretending to obtain real Apple headers.
+    func finishReturning(_ result: (headers: [String: String], newBlob: Data?)) async throws
+        -> (headers: [String: String], newBlob: Data?) {
+        let cleaned = await provider.finish()
+        session.invalidateAndCancel()
+        guard cleaned else { throw AnisetteError.adiError(code: -6, description: "Owned native cleanup failed") }
+        if let beforeResultReturn { await beforeResultReturn() }
+        try checkCancellation()
+        return result
+    }
 
     public func fetch(existingBlob: Data?, headers: AnisetteRequestHeaders? = nil) async throws
         -> (headers: [String: String], newBlob: Data?) {
@@ -64,15 +86,11 @@ public final class OwnedOnDeviceAnisetteAttempt: @unchecked Sendable {
         guard admitted else { throw AnisetteError.invalidArgument }
         return try await withTaskCancellationHandler {
             do {
-                try Task.checkCancellation()
+                try checkCancellation()
                 let result = try await client.getAnisetteData(identifier: identifier,
                     storage: .memory(existingBlob: existingBlob), headers: headers)
-                try Task.checkCancellation()
-                let cleaned = await provider.finish()
-                session.invalidateAndCancel()
-                guard cleaned else { throw AnisetteError.adiError(code: -6, description: "Owned native cleanup failed") }
-                try Task.checkCancellation()
-                return result
+                try checkCancellation()
+                return try await finishReturning(result)
             } catch {
                 cancel()
                 let cleaned = await provider.finish()

@@ -22,7 +22,7 @@ final class OwnedOnDeviceAnisetteAttemptTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try children(parent).count, 1)
         attempt.cancel()
         do { _ = try await attempt.fetch(existingBlob: Data([1])); XCTFail("Cancelled attempt returned headers") }
-        catch { /* Expected cancellation/native rejection, after cleanup. */ }
+        catch { XCTAssertTrue(error is CancellationError) }
         XCTAssertEqual(try children(parent), [])
         do { _ = try await attempt.fetch(existingBlob: Data([1])); XCTFail("Attempt admitted twice") }
         catch { }
@@ -89,6 +89,30 @@ final class OwnedOnDeviceAnisetteAttemptTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try children(parent), [])
         OwnedLookupFixture.configure(stall: false, started: nil)
     }
+    func testExplicitCancelAtCompletedNativeReturnBoundarySuppressesHeaders() async throws {
+        let parent = try root(); defer { try? FileManager.default.removeItem(at: parent) }
+        let entered = expectation(description: "native drain completed before returning headers")
+        let gate = OwnedReturnGate()
+        let attempt = try await OwnedOnDeviceAnisetteAttempt(libraryDirectory: parent,
+            verifiedLibraries: libraries, scratchParent: parent, identifier: UUID(),
+            transportConfiguration: .ephemeral, beforeResultReturn: {
+                entered.fulfill()
+                await gate.wait()
+            })
+        // Supply synthetic already-completed output to the ACTUAL completion
+        // boundary, not a fake successful guest or Apple authentication call.
+        let operation = Task {
+            try await attempt.finishReturning((headers: ["fixture": "synthetic"], newBlob: Data([1])))
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        XCTAssertEqual(try children(parent), [])
+        attempt.cancel() // deliberately do NOT cancel the Swift Task
+        await gate.release()
+        do { _ = try await operation.value; XCTFail("Explicit cancellation returned late headers/blob") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(operation.isCancelled)
+        XCTAssertEqual(try children(parent), [])
+    }
     func testMemoryOnlyClientNeverReadsOrDeletesExistingDiskState() async throws {
         let parent = try root(); defer { try? FileManager.default.removeItem(at: parent) }
         let id = UUID()
@@ -136,4 +160,17 @@ private final class OwnedLookupFixture: URLProtocol, @unchecked Sendable {
         if !stall { client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost)) }
     }
     override func stopLoading() { }
+}
+
+private actor OwnedReturnGate {
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() {
+        released = true
+        continuation?.resume(); continuation = nil
+    }
 }

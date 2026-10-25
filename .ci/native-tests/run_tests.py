@@ -247,7 +247,7 @@ class MaintainedAnisetteNativeTests(unittest.TestCase):
             (build / 'Loader/elf_loader_emulator.h').write_text(source('Native/Loader/elf_loader_emulator.h'))
             shutil.copyfile(ROOT / 'Native/Loader/elf_metadata_bounds.h', build / 'Loader/elf_metadata_bounds.h')
             shutil.copyfile(ROOT / 'Native/Loader/vm_initialization_diagnostics.h', build / 'Loader/vm_initialization_diagnostics.h')
-            for header in ('bounded_fault_diagnostics.h', 'bounded_fault_runtime.h', 'bounded_asset_digest.h', 'native_logging_policy.h', 'owned_attempt_lifecycle.h', 'owned_attempt_filesystem.h'):
+            for header in ('bounded_fault_diagnostics.h', 'bounded_fault_runtime.h', 'bounded_asset_digest.h', 'native_logging_policy.h') + ('owned_attempt_lifecycle.h', 'owned_attempt_filesystem.h'):
                 shutil.copyfile(ROOT / 'Native/Loader' / header, build / 'Loader' / header)
             shutil.copyfile(ROOT / 'Native/Loader/android_tls_runtime.h', build / 'android_tls_runtime.h')
             for path in ('Native/anisette_base.h', 'Native/include/anisette_core.h', 'Native/anisette_base.cpp'):
