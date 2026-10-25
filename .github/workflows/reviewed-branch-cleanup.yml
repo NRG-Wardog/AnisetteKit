@@ -11,7 +11,7 @@ concurrency:
   group: reviewed-branch-cleanup
   cancel-in-progress: false
 env:
-  REVIEWED_MANIFEST_SHA256: bf252b9f01fe78da1a651f2c4bd62fe9561241b30d1e15ceeeba709fe9f2a6be
+  REVIEWED_MANIFEST_SHA256: cec847a158583ff6f800394f4cfcbaea27c75e976039a668bec6fafee4f8f854
 
 jobs:
   verify:

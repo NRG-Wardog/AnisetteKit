@@ -1,441 +1,135 @@
 {
-  "repository_full_name": "NRG-Wardog/AnisetteKit",
   "actual_default_branch": "main",
-  "audited_default_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-  "execution_revision": 2,
-  "execution_revision_reason": "Corrected the GET-only API route validator to permit exact SHA comparisons while rejecting traversal. Prior SAR verification failed before apply; no deletion occurred.",
-  "reviewed_inventory_sha256": "450891d9f2649e5244368f536489fc66df5d56316bed930bcfdb275e80da57b7",
-  "ancestry_report_sha256": "eafeec489d94886e3ac8a9c02809e9a77611ba831594950334683deaa9fd9eab",
-  "ancestry_run_id": 40138459790,
-  "ancestry_workflow_sha": "aa6223a0e922d8e8455400549bb6947f7deffb79",
-  "source_review_complete": true,
-  "source_review_scope": "Targeted review of current repository-owned workflow acquisitions, .gitmodules, package/build manifests and dependency-rewriting scripts for the exact proposed branch names. This is not an exhaustive application-source or dynamic-ref certification. Fresh runtime exclusions remain required.",
-  "source_review_evidence": {
-    "functional_review_sha256": "0f8b918a3ad6c21d0d929e781f91d1f0db5772469634821f2bd31f0f6a876b67",
-    "reviewed_public_sources": [
-      {
-        "url": "https://github.com/NRG-Wardog/LiveContainer/blob/8f0ad98068ab75298be40b404f1d1a25d8ecbbbf/.gitmodules",
-        "sha256": "2990fa4dabfb0182aa69679ffab5e6444a45476070894efb20928ebb473c1d0a"
+  "audited_default_sha": "cb9d56a0670014fa0f4b37f6cc9d3ba0ffd96848",
+  "candidates": [
+    {
+      "actual_default_branch": "main",
+      "ancestry": {
+        "base_sha": "a04485e25ab4ab1dc41c81f5061c3b442d588660",
+        "behind_by": 0,
+        "head_sha": "87a76cb0648edf43e83705d8138de7ebc4f132ea",
+        "merge_base_sha": "a04485e25ab4ab1dc41c81f5061c3b442d588660",
+        "status": "ahead"
       },
-      {
-        "url": "https://github.com/NRG-Wardog/SideStore/blob/c2beadd2c94df6854f83cb53d5b59c3540ec9783/.gitmodules",
-        "sha256": "eeb38935b866879950a482324b4fe03b7791df636cd6da89b5d6c112b7f0ecf5"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/SideSign/blob/483c626d6e5004b45298518352307eb492fe1ccd/Package.swift",
-        "sha256": "dcd3b5c041712503180bda8e2d94bc873b9a38d4ca03e441118a9806070a3c17"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/idevice/blob/774f02a6d29777c85400f4ba7fa69c12b4227fb3/Cargo.toml",
-        "sha256": "c390ce8ae9f2cee08b07d7bf726e928cf6fbcf2fbb9d9d02d9e9c266adcb41bf"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/jktcp/blob/a46594f6af56b66b6d9342ed9f5ee6d1b7fb9cc9/Cargo.toml",
-        "sha256": "e20113e6b83e9621f103916a2e39766801cc7f01947ad53192d3a1a9332bdbd8"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/minimuxer/blob/4ca3af5270de8aa48e8bc100eadf1b3550260ea2/Package.swift",
-        "sha256": "b4849af42725b7176206a3d76b2a9bd60dc6399217deb811963c41e316951aa5"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/AnisetteKit/blob/3e670c2e1b72ff328d3a64353d8de2418df87e73/Package.swift",
-        "sha256": "a8ea2defa17b0f943ef824578146381bda02665a24a61fe00dd28254cf5b4b85"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/idevice/blob/774f02a6d29777c85400f4ba7fa69c12b4227fb3/idevice/Cargo.toml",
-        "sha256": "68417b615ed59fe9b6e22d2c43ee64cc085a19368c668477972e89d3caa1d427"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/idevice/blob/774f02a6d29777c85400f4ba7fa69c12b4227fb3/.gitmodules",
-        "sha256": "af90802a99b765d0ce69bdcaa9fec8b24f7d51989e4ebf92d383db17dd44166b"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/SideStore/blob/c2beadd2c94df6854f83cb53d5b59c3540ec9783/Makefile",
-        "sha256": "39c5ca7ccca829bcf98da32230b14088c702261fdf9352cd6c234c27489c1b5d"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/LiveContainer/blob/8f0ad98068ab75298be40b404f1d1a25d8ecbbbf/.github/build_github.sh",
-        "sha256": "532d833b2c16eb920e29b5ad3d93d65e01c99b5d4ca1d75ffce010de47d48b87"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/minimuxer/blob/4ca3af5270de8aa48e8bc100eadf1b3550260ea2/DeviceGateway/Package.swift",
-        "sha256": "ecb4a9cbd63f68b1b4dd321c300c28148e996c91b149857d558f2d2a02b0e0ed"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/minimuxer/blob/4ca3af5270de8aa48e8bc100eadf1b3550260ea2/Common/Package.swift",
-        "sha256": "09667199d39647e9dbbb787bae442a1c8e8132636f91a26400abdb4acf2ce575"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/SideStore/blob/c2beadd2c94df6854f83cb53d5b59c3540ec9783/AltStore.xcodeproj/project.pbxproj",
-        "sha256": "0690f418830c32b4475f447972c209744f49a44d17fc41251ec33d422375e9c5"
-      },
-      {
-        "url": "https://github.com/NRG-Wardog/SideStore/blob/c2beadd2c94df6854f83cb53d5b59c3540ec9783/AltStore.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
-        "sha256": "e97604f913903659539663f09176a20ee9ca5fe06188a41ff38f54257d076d08"
-      }
-    ],
-    "sar_commit": "aa6223a0e922d8e8455400549bb6947f7deffb79",
-    "sar_current_files": {
-      "build-current.yml": "a703477bc210c30f87011ff6035af6ca80f65927bc20356ab6c74dc676956ad4",
-      "livecontainer-build.yml": "29b31aee8478c1d209b2be0565045b6b1a33681e9ce4d5e4416ffecc99c54d9a",
-      "livecontainer-source-audit.yml": "f44c25cd2f1a09be0448b39323b92da719c41d631a14a55cf95a8469a3bbac6e",
-      "release-dispatch.yml": "6546d7bbba040b1fb2fd8860ba285f645515adac2bdc278e35b1eabda77d45a3",
-      "patch_local_idevice_package.py": "2162242554c544b426bf0d8451830f2873dc69f5577121e2023794525f53f3f9",
-      "patch_coredevice_idevice.py": "f5fb70f227f1a1b094051ea61cddcd05a1f63ae97ebd1ae6f755e2c9815a7b07",
-      "patch_jktcp_reliability.py": "795547f9e817193d9c2a395710a3bcea69b269ae026d5ddc516eecc1a396cef4"
+      "branch_name": "debug/adi-rejection-ff5a1af",
+      "disposition": "eligible",
+      "expected_branch_sha": "a04485e25ab4ab1dc41c81f5061c3b442d588660",
+      "functional_dependency_checks_complete": true,
+      "protected": false,
+      "repository_full_name": "NRG-Wardog/AnisetteKit",
+      "retained_anchor_ref": "refs/heads/research/adi-binary-match-20261009",
+      "retained_anchor_sha": "87a76cb0648edf43e83705d8138de7ebc4f132ea"
     },
-    "SideSign_gitmodules": "Absent (404) at 483c626d6e5004b45298518352307eb492fe1ccd.",
-    "remaining_named_ref_findings": "No additional candidate branch references found. The external SideStore/jktcp master literal is outside cleanup scope and replaced by a local path."
-  },
-  "required_runtime_checks": [
-    "actual_default",
-    "branch_heads",
-    "retained_ancestry",
-    "protected_branches",
-    "open_pull_requests",
-    "active_workflow_runs",
-    "release_targets"
+    {
+      "actual_default_branch": "main",
+      "ancestry": {
+        "base_sha": "ff5a1af34fe1fef443c1f82e614c073e21054970",
+        "behind_by": 0,
+        "head_sha": "87a76cb0648edf43e83705d8138de7ebc4f132ea",
+        "merge_base_sha": "ff5a1af34fe1fef443c1f82e614c073e21054970",
+        "status": "ahead"
+      },
+      "branch_name": "fix/adi-abi-20261008",
+      "disposition": "eligible",
+      "expected_branch_sha": "ff5a1af34fe1fef443c1f82e614c073e21054970",
+      "functional_dependency_checks_complete": true,
+      "protected": false,
+      "repository_full_name": "NRG-Wardog/AnisetteKit",
+      "retained_anchor_ref": "refs/heads/research/adi-binary-match-20261009",
+      "retained_anchor_sha": "87a76cb0648edf43e83705d8138de7ebc4f132ea"
+    }
+  ],
+  "dependency_snapshots": [
+    {
+      "expected_sha": "0678baab19c2ad456c0f5123b9c24c0959436821",
+      "kind": "actual_default",
+      "ref": "refs/heads/main",
+      "repository_full_name": "NRG-Wardog/sidestore-auto-refresh"
+    },
+    {
+      "expected_sha": "c7111b580254190a0c037037036aaed49bfce8c6",
+      "kind": "actual_default",
+      "ref": "refs/heads/main",
+      "repository_full_name": "NRG-Wardog/LiveContainer"
+    },
+    {
+      "expected_sha": "18ab80ac78853e988adbe5dab67a1f9f4027eff4",
+      "kind": "actual_default",
+      "ref": "refs/heads/LiveContainerSupport",
+      "repository_full_name": "NRG-Wardog/SideStore"
+    },
+    {
+      "expected_sha": "a1681f83612932bc1d68ccd007918fdb3fe7ca88",
+      "kind": "actual_default",
+      "ref": "refs/heads/main",
+      "repository_full_name": "NRG-Wardog/SideSign"
+    },
+    {
+      "expected_sha": "cb9d56a0670014fa0f4b37f6cc9d3ba0ffd96848",
+      "kind": "actual_default",
+      "ref": "refs/heads/main",
+      "repository_full_name": "NRG-Wardog/AnisetteKit"
+    },
+    {
+      "expected_sha": "fe049d6431418bbc9aee6ab282a07cde9ba71dff",
+      "kind": "actual_default",
+      "ref": "refs/heads/develop",
+      "repository_full_name": "NRG-Wardog/minimuxer"
+    },
+    {
+      "expected_sha": "b892fed1c87701ab0d05926a10a49dc042d2b0b2",
+      "kind": "actual_default",
+      "ref": "refs/heads/master",
+      "repository_full_name": "NRG-Wardog/idevice"
+    },
+    {
+      "expected_sha": "ca21d888eb8d978e5116decfa3f990712d96c5ad",
+      "kind": "actual_default",
+      "ref": "refs/heads/master",
+      "repository_full_name": "NRG-Wardog/jktcp"
+    },
+    {
+      "expected_sha": "87a76cb0648edf43e83705d8138de7ebc4f132ea",
+      "kind": "immutable_branch",
+      "ref": "refs/heads/research/adi-binary-match-20261009",
+      "repository_full_name": "NRG-Wardog/AnisetteKit"
+    }
+  ],
+  "integration_commits": [
+    "2591361545afd14a637b91fa78ce376589e7f326",
+    "a1681f83612932bc1d68ccd007918fdb3fe7ca88"
+  ],
+  "integration_runs": [
+    40176266114
+  ],
+  "pr_repositories": [
+    "NRG-Wardog/sidestore-auto-refresh",
+    "NRG-Wardog/LiveContainer",
+    "NRG-Wardog/SideStore",
+    "NRG-Wardog/SideSign",
+    "NRG-Wardog/AnisetteKit",
+    "NRG-Wardog/minimuxer",
+    "NRG-Wardog/idevice",
+    "NRG-Wardog/jktcp",
+    "mahee96/AnisetteKit"
   ],
   "preserved_branch_names": [
-    "debug/adi-rejection-ff5a1af",
-    "fix/adi-abi-20261008",
-    "main",
     "migration/runtime-source-141776ba",
     "research/adi-binary-match-20261009",
     "validation/p0-remote-reserve-20261019",
     "validation/pr1835-quick"
   ],
-  "dependency_snapshots": [
-    {
-      "repository_full_name": "NRG-Wardog/sidestore-auto-refresh",
-      "ref": "refs/heads/main",
-      "expected_sha": "aa6223a0e922d8e8455400549bb6947f7deffb79",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/LiveContainer",
-      "ref": "refs/heads/main",
-      "expected_sha": "8f0ad98068ab75298be40b404f1d1a25d8ecbbbf",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/SideStore",
-      "ref": "refs/heads/LiveContainerSupport",
-      "expected_sha": "c2beadd2c94df6854f83cb53d5b59c3540ec9783",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/SideSign",
-      "ref": "refs/heads/main",
-      "expected_sha": "483c626d6e5004b45298518352307eb492fe1ccd",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "ref": "refs/heads/main",
-      "expected_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/minimuxer",
-      "ref": "refs/heads/develop",
-      "expected_sha": "4ca3af5270de8aa48e8bc100eadf1b3550260ea2",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/idevice",
-      "ref": "refs/heads/master",
-      "expected_sha": "774f02a6d29777c85400f4ba7fa69c12b4227fb3",
-      "kind": "actual_default"
-    },
-    {
-      "repository_full_name": "NRG-Wardog/jktcp",
-      "ref": "refs/heads/master",
-      "expected_sha": "a46594f6af56b66b6d9342ed9f5ee6d1b7fb9cc9",
-      "kind": "actual_default"
-    }
+  "repository_full_name": "NRG-Wardog/AnisetteKit",
+  "required_runtime_checks": [
+    "active_workflow_runs",
+    "actual_default",
+    "branch_heads",
+    "open_pull_requests",
+    "protected_branches",
+    "release_targets",
+    "retained_ancestry"
   ],
-  "pr_repositories": [
-    "LiveContainer/LiveContainer",
-    "LiveContainer/SideStore",
-    "NRG-Wardog/AnisetteKit",
-    "NRG-Wardog/LiveContainer",
-    "NRG-Wardog/SideSign",
-    "NRG-Wardog/SideStore",
-    "NRG-Wardog/idevice",
-    "NRG-Wardog/jktcp",
-    "NRG-Wardog/minimuxer",
-    "NRG-Wardog/sidestore-auto-refresh",
-    "SideStore/SideSign",
-    "SideStore/idevice",
-    "SideStore/jktcp",
-    "SideStore/minimuxer",
-    "altstoreio/AltStore",
-    "jkcoxson/idevice",
-    "jkcoxson/jktcp",
-    "jkcoxson/minimuxer",
-    "mahee96/AnisetteKit"
-  ],
-  "candidates": [
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "debug/adi-consumption-investigation",
-      "expected_branch_sha": "e530b84687ebea2e7d1115119e1a6d18372de14b",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "e530b84687ebea2e7d1115119e1a6d18372de14b",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 14,
-        "behind_by": 0,
-        "merge_base_sha": "e530b84687ebea2e7d1115119e1a6d18372de14b"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "debug/adi-staging-order",
-      "expected_branch_sha": "f494494ede88890555df345054f7fbb87b53aea5",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "f494494ede88890555df345054f7fbb87b53aea5",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 13,
-        "behind_by": 0,
-        "merge_base_sha": "f494494ede88890555df345054f7fbb87b53aea5"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "fix/p0-constructor-diagnostics",
-      "expected_branch_sha": "94659b4d54eed5729b34f4103b3f70579aa8d8e9",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "94659b4d54eed5729b34f4103b3f70579aa8d8e9",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 11,
-        "behind_by": 0,
-        "merge_base_sha": "94659b4d54eed5729b34f4103b3f70579aa8d8e9"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "fix/p0-cxx-allocation-runtime",
-      "expected_branch_sha": "161435bcc0344e1a9853669455c1ca8d9dda2bf1",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "161435bcc0344e1a9853669455c1ca8d9dda2bf1",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 8,
-        "behind_by": 0,
-        "merge_base_sha": "161435bcc0344e1a9853669455c1ca8d9dda2bf1"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "fix/p0-elf-metadata-bounds",
-      "expected_branch_sha": "9c876820d102affe2f55ee4b7f735fff6abd990a",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "9c876820d102affe2f55ee4b7f735fff6abd990a",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 9,
-        "behind_by": 0,
-        "merge_base_sha": "9c876820d102affe2f55ee4b7f735fff6abd990a"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "fix/v3.1.0-p0",
-      "expected_branch_sha": "0dfcc89aa93411d84f7c50beb3c75599af89e852",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "0dfcc89aa93411d84f7c50beb3c75599af89e852",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 12,
-        "behind_by": 0,
-        "merge_base_sha": "0dfcc89aa93411d84f7c50beb3c75599af89e852"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/p0-defensive-ab-20261019",
-      "expected_branch_sha": "e72d04b84123823c93e9162daffa73b7afcfd2c9",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "e72d04b84123823c93e9162daffa73b7afcfd2c9",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 6,
-        "behind_by": 0,
-        "merge_base_sha": "e72d04b84123823c93e9162daffa73b7afcfd2c9"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/p0-defensive-diagnostic-20261019",
-      "expected_branch_sha": "227dfd8c8456cd62e4ceff4971b17afb2003d7e8",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "227dfd8c8456cd62e4ceff4971b17afb2003d7e8",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 5,
-        "behind_by": 0,
-        "merge_base_sha": "227dfd8c8456cd62e4ceff4971b17afb2003d7e8"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/p0-fault-aggregate-20261019",
-      "expected_branch_sha": "56f9aab3b2726821ed460e770c531e72a8233b8b",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "56f9aab3b2726821ed460e770c531e72a8233b8b",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 4,
-        "behind_by": 0,
-        "merge_base_sha": "56f9aab3b2726821ed460e770c531e72a8233b8b"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/p0-login-trace-20261018",
-      "expected_branch_sha": "e6e9d4aac698de2a5219aaef02c9a417da45f4e9",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "e6e9d4aac698de2a5219aaef02c9a417da45f4e9",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 7,
-        "behind_by": 0,
-        "merge_base_sha": "e6e9d4aac698de2a5219aaef02c9a417da45f4e9"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/upstream-first-6.0",
-      "expected_branch_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "identical",
-        "ahead_by": 0,
-        "behind_by": 0,
-        "merge_base_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/upstream-sync-20261021",
-      "expected_branch_sha": "20c17ed96763c7ab39053e9f7a82532a88ad7654",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "20c17ed96763c7ab39053e9f7a82532a88ad7654",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 1,
-        "behind_by": 0,
-        "merge_base_sha": "20c17ed96763c7ab39053e9f7a82532a88ad7654"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    },
-    {
-      "repository_full_name": "NRG-Wardog/AnisetteKit",
-      "branch_name": "validation/workqueue-abi-20261020",
-      "expected_branch_sha": "d444374cbd332b07dadf4e99effcc018cfd22b94",
-      "protected": false,
-      "retained_anchor_ref": "refs/heads/main",
-      "retained_anchor_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "retained_anchor_object_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-      "ancestry": {
-        "base_sha": "d444374cbd332b07dadf4e99effcc018cfd22b94",
-        "head_sha": "3e670c2e1b72ff328d3a64353d8de2418df87e73",
-        "status": "ahead",
-        "ahead_by": 3,
-        "behind_by": 0,
-        "merge_base_sha": "d444374cbd332b07dadf4e99effcc018cfd22b94"
-      },
-      "actual_default_branch": "main",
-      "disposition": "eligible",
-      "functional_dependency_checks_complete": true
-    }
-  ]
+  "reviewed_inventory_sha256": "41a7b8ab5a8a095a4b0d3d1dcb4261004df9ef965a7657261fe1f24b4bb53ca8",
+  "source_review_complete": true,
+  "source_review_scope": "Ancestry-covered intermediate refs only; all exact histories remain under excluded immutable descendant heads. Necessary current production geometry/recovery and HTTP hardening were narrowly ported and passed focused/native validation. Obsolete Windows/reserve behavior is not restored; current AK ABI implementation was source-compared. Historical compile/package runs refer to immutable commits and their recorded head labels, not requiring current branch ref existence. Fresh branch/default/PR/release/active-run exclusions remain mandatory. No unique-history deletion is authorized."
 }
