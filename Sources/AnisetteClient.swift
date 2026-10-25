@@ -49,6 +49,8 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
     public let lookupURL: URL
     public let requiredLibraries: [String]
     public let provider: any AnisetteDataProvider
+    private let networkSession: URLSession
+    private let allowsDiskStorage: Bool
 
     let routingInfoLock = NSLock()
     var routingInfoCache = [UUID: String]()
@@ -60,11 +62,15 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         lookupURL: URL = AnisetteConstants.URLs.grandSlamLookup,
         requiredLibraries: [String] = AnisetteConstants.Libraries.requiredNames,
         provider: (any AnisetteDataProvider)? = nil,
-        libraryDirectoryResolver: LibraryDirectoryResolver? = nil
+        libraryDirectoryResolver: LibraryDirectoryResolver? = nil,
+        networkSession: URLSession = .shared,
+        allowsDiskStorage: Bool = true
     ) throws {
         let diagnosticSpan = LoginDiagnosticTrace.current?.begin(.clientInitialization)
         do {
         self.provisioningDir = provisioningDir
+        self.networkSession = networkSession
+        self.allowsDiskStorage = allowsDiskStorage
         self.clientInfo = clientInfo
         self.userAgent = userAgent
         self.lookupURL = lookupURL
@@ -124,7 +130,8 @@ public class AnisetteClient: AnisetteClientProtocol, @unchecked Sendable {
         storage: ProvisioningStorage = .disk,
         headers customHeaders: AnisetteRequestHeaders? = nil
     ) async throws -> (headers: [String: String], newBlob: Data?) {
-        try await withLoginDiagnosticStage(.anisetteFetch) {
+        if !allowsDiskStorage, case .disk = storage { throw AnisetteError.invalidArgument }
+        return try await withLoginDiagnosticStage(.anisetteFetch) {
             try await fetchHeaders(identifier: identifier, storage: storage, customHeaders: customHeaders, provider: self.provider)
         }
     }
@@ -203,7 +210,7 @@ extension AnisetteClient {
         let rinfoURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.rinfo)
 
         let cleanup: () -> Void = {
-            if case .memory = storage {
+            if self.allowsDiskStorage, case .memory = storage {
                 try? FileManager.default.removeItem(at: adiPbURL)
                 try? FileManager.default.removeItem(at: rinfoURL)
                 try? FileManager.default.removeItem(at: uuidProvDir)
@@ -245,6 +252,7 @@ extension AnisetteClient {
         if let cached = getCachedRoutingInfo(for: identifier) {
             return cached
         }
+        guard allowsDiskStorage else { return nil }
         let uuidProvDir = provisioningDir.appendingPathComponent(identifier.uuidString.lowercased())
         let rinfoURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.rinfo)
         if let saved = try? String(contentsOf: rinfoURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !saved.isEmpty {
@@ -312,10 +320,12 @@ extension AnisetteClient {
 
         if let finalRinfo = activeRoutingInfo {
             setCachedRoutingInfo(finalRinfo, for: identifier)
+            if allowsDiskStorage {
             let uuidProvDir = provisioningDir.appendingPathComponent(identifier.uuidString.lowercased())
             try? FileManager.default.createDirectory(at: uuidProvDir, withIntermediateDirectories: true, attributes: nil)
             let rinfoURL = uuidProvDir.appendingPathComponent(AnisetteConstants.Files.rinfo)
             try? finalRinfo.write(to: rinfoURL, atomically: true, encoding: String.Encoding.utf8)
+            }
         }
 
         return adiPb
@@ -344,7 +354,7 @@ extension AnisetteClient {
     }
 
     private func sendRequest(_ req: URLRequest, step: String, endpointName: String) async throws -> (data: Data, response: URLResponse) {
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await networkSession.data(for: req)
         let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard statusCode == 200 else {
             throw AnisetteError.httpError(statusCode: statusCode, message: "\(endpointName) endpoint returned HTTP \(statusCode)")

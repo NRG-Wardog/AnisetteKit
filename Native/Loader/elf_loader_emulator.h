@@ -25,6 +25,9 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <memory>
+#include "owned_attempt_lifecycle.h"
+#include "owned_attempt_filesystem.h"
 #include <unicorn/unicorn.h>
 #include "anisette_base.h"
 #include "vm_initialization_diagnostics.h"
@@ -98,6 +101,10 @@ struct EmulatorVM {
         std::vector<std::string> needed_libs;
     };
 
+    std::shared_ptr<anisette_owned_attempt::Control> attempt_control;
+    uint32_t attempt_poll_count = 0;
+    uint64_t attempt_written_bytes = 0;
+    std::shared_ptr<anisette_owned_attempt::Filesystem> attempt_filesystem;
     bool initialization_failed = false;
     bool unsupported_interrupt = false;
     bool read_only_filesystem = false;
@@ -124,7 +131,7 @@ struct EmulatorVM {
     std::vector<LibraryInfo> loaded_libraries;
 
     // Legacy argument retained for source compatibility; all modes are checked.
-    explicit EmulatorVM(bool checked = false);
+    explicit EmulatorVM(bool checked = false, std::shared_ptr<anisette_owned_attempt::Control> control = nullptr);
     ~EmulatorVM();
 
     uint64_t register_import(const std::string &name);

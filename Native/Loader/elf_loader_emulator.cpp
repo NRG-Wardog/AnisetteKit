@@ -97,10 +97,22 @@ static inline int gettimeofday(struct timeval *tv, void *tz) {
 
 const AndroidSystemProperties kAndroidProperties;
 
+// Only called by the owning native worker. Cancellation never calls Unicorn
+// from another thread and cannot falsely acknowledge a blocked host callback.
+static bool owned_attempt_poll(EmulatorVM *vm) {
+    if (!vm->attempt_control || vm->attempt_control->check()) return true;
+    vm->initialization_failed = true;
+    if (vm->uc) uc_emu_stop(vm->uc);
+    return false;
+}
+
 static thread_local uint64_t g_last_pcs[16];
 static thread_local size_t g_pc_idx = 0;
 
 static void trace_pc_hook(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    auto *vm = static_cast<EmulatorVM *>(user_data);
+    if (vm && vm->attempt_control && (++vm->attempt_poll_count % 256 == 0) && !owned_attempt_poll(vm)) return;
+
     (void)uc; (void)size; (void)user_data;
     g_last_pcs[g_pc_idx % 16] = address;
     g_pc_idx++;
@@ -178,8 +190,8 @@ uint64_t PageAllocator::alloc(uint64_t bytes) {
 static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
 static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data);
 
-EmulatorVM::EmulatorVM(bool checked)
-    : uc(nullptr),
+EmulatorVM::EmulatorVM(bool checked, std::shared_ptr<anisette_owned_attempt::Control> control)
+    : attempt_control(std::move(control)), uc(nullptr),
       heap(kHeapAddress, kHeapSize, 64),
       library_alloc(kLibraryAddress, kLibrarySize, 0x10000),
       next_import_address(kImportAddress),
@@ -187,6 +199,7 @@ EmulatorVM::EmulatorVM(bool checked)
 {
     // Retain the argument for source compatibility; every VM is checked.
     (void)checked;
+    if (attempt_control && !attempt_control->check()) throw std::runtime_error("Attempt stopped before VM creation");
     const auto logging_mode = anisette_native_logging::configure_before_first_vm();
     if (logging_mode == anisette_native_logging::StartupMode::Failed) {
         throw std::runtime_error("Native diagnostic startup configuration failed");
@@ -202,7 +215,7 @@ EmulatorVM::EmulatorVM(bool checked)
     }
 
     auto check = [&](uc_err result) {
-        if (result != UC_ERR_OK) {
+        if (result != UC_ERR_OK || (attempt_control && !attempt_control->check())) {
             uc_close(uc); uc = nullptr;
             throw std::runtime_error("VM mapping or hook initialization failed");
         }
@@ -299,6 +312,7 @@ static void fail_guest_operation(EmulatorVM *vm) noexcept {
 }
 
 static bool checked_guest_read(EmulatorVM *vm, uint64_t address, void *data, size_t size) {
+    if (!owned_attempt_poll(vm)) return false;
     uint64_t end = 0;
     // Host memory APIs do not stand in for guest page permissions. Preserve the
     // VM's reserved no-access low page for these host-mediated transfers too.
@@ -312,6 +326,7 @@ static bool checked_guest_read(EmulatorVM *vm, uint64_t address, void *data, siz
 }
 
 static bool checked_guest_write(EmulatorVM *vm, uint64_t address, const void *data, size_t size) {
+    if (!owned_attempt_poll(vm)) return false;
     uint64_t end = 0;
     if (vm->initialization_failed || (size && address < 0x10000) ||
         !elf_metadata_bounds::add(address, size, end) ||
@@ -368,7 +383,7 @@ uint64_t EmulatorVM::write_string(const char *str) {
     return write_bytes((const uint8_t *)str, len);
 }
 
-static EmulatorVM *g_active_vm = nullptr;
+static thread_local EmulatorVM *g_active_vm = nullptr;
 
 static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data) {
     (void)user_data;
@@ -398,6 +413,7 @@ static void hook_cxx_new(EmulatorVM *vm) {
 }
 
 static bool checked_guest_range(EmulatorVM *vm, uint64_t address, uint64_t size) {
+    if (!owned_attempt_poll(vm)) return false;
     uint64_t end = 0;
     if (vm->initialization_failed || (size && address < 0x10000) ||
         !elf_metadata_bounds::add(address, size, end)) {
@@ -495,10 +511,10 @@ static void hook_strcmp(EmulatorVM *vm) {
     std::string s1, s2;
     char c = 0;
     if (s1_ptr) {
-        while (uc_mem_read(vm->uc, s1_ptr++, &c, 1) == UC_ERR_OK && c != '\0') s1.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, s1_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && s1.size() >= 1048576) { fail_guest_operation(vm); return; } s1.push_back(c); }
     }
     if (s2_ptr) {
-        while (uc_mem_read(vm->uc, s2_ptr++, &c, 1) == UC_ERR_OK && c != '\0') s2.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, s2_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && s2.size() >= 1048576) { fail_guest_operation(vm); return; } s2.push_back(c); }
     }
     int64_t cmp_res = (int64_t)s1.compare(s2);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &cmp_res);
@@ -512,10 +528,10 @@ static void hook_strncmp(EmulatorVM *vm) {
     std::string s1, s2;
     char c = 0;
     if (s1_ptr) {
-        for (uint64_t i = 0; i < n && uc_mem_read(vm->uc, s1_ptr + i, &c, 1) == UC_ERR_OK && c != '\0'; i++) s1.push_back(c);
+        for (uint64_t i = 0; i < n && owned_attempt_poll(vm) && uc_mem_read(vm->uc, s1_ptr + i, &c, 1) == UC_ERR_OK && c != '\0'; i++) { if (vm->attempt_control && s1.size() >= 1048576) { fail_guest_operation(vm); return; } s1.push_back(c); }
     }
     if (s2_ptr) {
-        for (uint64_t i = 0; i < n && uc_mem_read(vm->uc, s2_ptr + i, &c, 1) == UC_ERR_OK && c != '\0'; i++) s2.push_back(c);
+        for (uint64_t i = 0; i < n && owned_attempt_poll(vm) && uc_mem_read(vm->uc, s2_ptr + i, &c, 1) == UC_ERR_OK && c != '\0'; i++) { if (vm->attempt_control && s2.size() >= 1048576) { fail_guest_operation(vm); return; } s2.push_back(c); }
     }
     int64_t cmp_res = (int64_t)s1.compare(s2);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &cmp_res);
@@ -652,14 +668,15 @@ static void hook_open(EmulatorVM *vm) {
     char c = 0;
     bool path_complete = false;
     if (path_ptr) {
-        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK) {
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK) {
             if (c == '\0') { path_complete = true; break; }
-            path.push_back(c);
+            { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
         }
     }
 
     int host_flags = linux_to_darwin_open_flags((int)flags);
-    int host_fd = open(path.c_str(), host_flags, (mode_t)mode);
+    if (vm->attempt_control && (!path_complete || path.size() > 4096 || !owned_attempt_poll(vm))) { fail_guest_operation(vm); return; }
+    int host_fd = vm->attempt_filesystem ? vm->attempt_filesystem->open(path, host_flags, static_cast<unsigned>(mode)) : open(path.c_str(), host_flags, (mode_t)mode);
     const int observed_open_errno = host_fd < 0 ? errno : 0;
     struct HostFDGuard {
         int fd;
@@ -709,6 +726,7 @@ static void hook_read(EmulatorVM *vm) {
         !checked_register_read(vm, UC_ARM64_REG_X1, &buf_ptr) ||
         !checked_register_read(vm, UC_ARM64_REG_X2, &count) ||
         !checked_guest_range(vm, buf_ptr, count)) return;
+    if (vm->attempt_control && count > anisette_owned_attempt::Filesystem::max_io) { fail_guest_operation(vm); return; }
     int64_t res = -1;
     int observed_read_errno = 0, observed_copy = -1;
     auto it = vm->fd_map.find((int)guest_fd);
@@ -737,11 +755,21 @@ static void hook_write(EmulatorVM *vm) {
         !checked_register_read(vm, UC_ARM64_REG_X1, &buf_ptr) ||
         !checked_register_read(vm, UC_ARM64_REG_X2, &count) ||
         !checked_guest_range(vm, buf_ptr, count)) return;
+    if (vm->attempt_control && count > anisette_owned_attempt::Filesystem::max_io) { fail_guest_operation(vm); return; }
     int64_t res = -1;
     auto it = vm->fd_map.find((int)guest_fd);
     if (it != vm->fd_map.end()) {
         std::vector<uint8_t> tmp(count);
         if (!checked_guest_read(vm, buf_ptr, tmp.data(), count)) return;
+        if (vm->attempt_control) {
+            if (count > 16 * 1048576 - vm->attempt_written_bytes) { fail_guest_operation(vm); return; }
+            vm->attempt_written_bytes += count;
+            struct stat st{}; const off_t offset = lseek(it->second, 0, SEEK_CUR);
+            if (fstat(it->second, &st) != 0 || offset < 0 || uint64_t(offset) > anisette_owned_attempt::Filesystem::max_io ||
+                count > anisette_owned_attempt::Filesystem::max_io - uint64_t(offset) ||
+                st.st_size < 0 || uint64_t(st.st_size) > anisette_owned_attempt::Filesystem::max_io ||
+                count > anisette_owned_attempt::Filesystem::max_io - uint64_t(st.st_size)) { fail_guest_operation(vm); return; }
+        }
         res = (int64_t)write(it->second, tmp.data(), count);
     }
     // A successful write advances the stream outside passive read coverage.
@@ -756,6 +784,7 @@ static void hook_ftruncate(EmulatorVM *vm) {
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &guest_fd);
     uc_reg_read(vm->uc, UC_ARM64_REG_X1, &length);
     int64_t res = -1;
+    if (vm->attempt_control && length > anisette_owned_attempt::Filesystem::max_io) { fail_guest_operation(vm); return; }
     auto it = vm->fd_map.find((int)guest_fd);
     if (it != vm->fd_map.end()) {
         res = (int64_t)ftruncate(it->second, (off_t)length);
@@ -771,10 +800,10 @@ static void hook_mkdir(EmulatorVM *vm) {
     std::string path;
     char c = 0;
     if (path_ptr) {
-        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') path.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
     }
-    int res = mkdir(path.c_str(), (mode_t)mode);
-    if (res != 0 && errno == EEXIST) {
+    int res = vm->attempt_filesystem ? vm->attempt_filesystem->mkdir(path) : mkdir(path.c_str(), (mode_t)mode);
+    if (!vm->attempt_control && res != 0 && errno == EEXIST) {
         res = 0;
         uint32_t zero_err = 0;
         uc_mem_write(vm->uc, vm->errno_addr, &zero_err, sizeof(zero_err));
@@ -790,6 +819,7 @@ static void hook_mkdir(EmulatorVM *vm) {
 }
 
 static void hook_umask(EmulatorVM *vm) {
+    if (vm->attempt_control) { int64_t value = 0077; checked_register_write(vm, UC_ARM64_REG_X0, &value); return; }
     if (deny_read_only_mutation(vm)) return;
     uint64_t mask = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &mask);
@@ -798,6 +828,7 @@ static void hook_umask(EmulatorVM *vm) {
 }
 
 static void hook_chmod(EmulatorVM *vm) {
+    if (vm->attempt_control) { int64_t value = -1; checked_register_write(vm, UC_ARM64_REG_X0, &value); return; }
     if (deny_read_only_mutation(vm)) return;
     uint64_t path_ptr = 0, mode = 0;
     uc_reg_read(vm->uc, UC_ARM64_REG_X0, &path_ptr);
@@ -805,7 +836,7 @@ static void hook_chmod(EmulatorVM *vm) {
     std::string path;
     char c = 0;
     if (path_ptr) {
-        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') path.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
     }
     int64_t res = (int64_t)chmod(path.c_str(), (mode_t)mode);
     uc_reg_write(vm->uc, UC_ARM64_REG_X0, &res);
@@ -818,10 +849,10 @@ static void hook_lstat(EmulatorVM *vm) {
     std::string path;
     char c = 0;
     if (path_ptr) {
-        while (uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') path.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
     }
     struct stat host_st;
-    int res = lstat(path.c_str(), &host_st);
+    int res = vm->attempt_filesystem ? vm->attempt_filesystem->stat(path, &host_st) : lstat(path.c_str(), &host_st);
     const int observed_lstat_errno = res < 0 ? errno : 0;
     if (res == 0 && stat_buf_ptr != 0) {
         StatLinux linux_st = {0};
@@ -939,7 +970,7 @@ static void hook_system_property_get(EmulatorVM *vm) {
     std::string name;
     char c = 0;
     if (name_ptr) {
-        while (uc_mem_read(vm->uc, name_ptr++, &c, 1) == UC_ERR_OK && c != '\0') name.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, name_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && name.size() >= 1048576) { fail_guest_operation(vm); return; } name.push_back(c); }
     }
     std::string prop_val = "";
     if (name == "ro.build.version.sdk") prop_val = kAndroidProperties.sdk_version;
@@ -1008,7 +1039,7 @@ static void hook_dlsym(EmulatorVM *vm) {
     std::string sym_name;
     char c = 0;
     if (sym_name_ptr) {
-        while (uc_mem_read(vm->uc, sym_name_ptr++, &c, 1) == UC_ERR_OK && c != '\0') sym_name.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, sym_name_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && sym_name.size() >= 1048576) { fail_guest_operation(vm); return; } sym_name.push_back(c); }
     }
     uint64_t addr = get_vm_symbol_address(vm, sym_name);
     if (!addr) {
@@ -1061,7 +1092,7 @@ static void hook_strtoll(EmulatorVM *vm) {
     std::string str;
     char c = 0;
     if (nptr) {
-        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && str.size() >= 1048576) { fail_guest_operation(vm); return; } str.push_back(c); }
     }
 
     char *host_end = nullptr;
@@ -1083,7 +1114,7 @@ static void hook_strtoull(EmulatorVM *vm) {
     std::string str;
     char c = 0;
     if (nptr) {
-        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && str.size() >= 1048576) { fail_guest_operation(vm); return; } str.push_back(c); }
     }
 
     char *host_end = nullptr;
@@ -1104,7 +1135,7 @@ static void hook_strtod(EmulatorVM *vm) {
     std::string str;
     char c = 0;
     if (nptr) {
-        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && str.size() >= 1048576) { fail_guest_operation(vm); return; } str.push_back(c); }
     }
 
     char *host_end = nullptr;
@@ -1126,7 +1157,7 @@ static void hook_atof(EmulatorVM *vm) {
     std::string str;
     char c = 0;
     if (nptr) {
-        while (uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') str.push_back(c);
+        while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, nptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && str.size() >= 1048576) { fail_guest_operation(vm); return; } str.push_back(c); }
     }
     double val = strtod(str.c_str(), nullptr);
     uint8_t d0_val[16] = {0};
@@ -1199,6 +1230,7 @@ static void import_callback_router(uc_engine *uc, uint64_t address, uint32_t siz
     EmulatorVM *vm = (EmulatorVM *)user_data;
     if (!vm) vm = g_active_vm;
     if (!vm) return;
+    if (!owned_attempt_poll(vm)) return;
     if (vm->initialization_failed) { uc_emu_stop(uc); return; }
 
     auto it = vm->import_stubs.find(address);
@@ -1368,6 +1400,7 @@ static bool apply_vm_relocations(EmulatorVM *vm, EmulatorVM::LibraryInfo &lib) {
     auto apply_table = [&](const std::vector<Elf64_Rela> &table, const char *label) {
         size_t applied = 0;
         for (const auto &r : table) {
+            if (!owned_attempt_poll(vm)) return false;
             const uint32_t type = static_cast<uint32_t>(ELF64_R_TYPE(r.r_info));
             const uint32_t sym_idx = static_cast<uint32_t>(ELF64_R_SYM(r.r_info));
             if (sym_idx >= lib.metadata.symbol_count) return false;
@@ -1405,13 +1438,23 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
     try {
         LOG_UC("[Emulator] Loading ELF library '%s' (path=omitted)...\n",
                anisette_native_logging::library_label(so_name.c_str()));
-        std::unique_ptr<FILE, int (*)(FILE *)> file(fopen(file_path.c_str(), "rb"), fclose);
+        if (!owned_attempt_poll(vm)) return fail("attempt stopped");
+        FILE *opened = nullptr;
+#if !defined(_WIN32) && !defined(_MSC_VER)
+        if (vm->attempt_filesystem) {
+            int fd = vm->attempt_filesystem->open(file_path, O_RDONLY, 0);
+            if (fd >= 0) { opened = fdopen(fd, "rb"); if (!opened) close(fd); }
+        } else
+#endif
+        { opened = fopen(file_path.c_str(), "rb"); }
+        std::unique_ptr<FILE, int (*)(FILE *)> file(opened, fclose);
         if (!file) return fail("file open failed");
         if (fseek(file.get(), 0, SEEK_END) != 0) return fail("file seek failed");
         const long length = ftell(file.get());
         if (length < 0 || static_cast<uint64_t>(length) > SIZE_MAX ||
             fseek(file.get(), 0, SEEK_SET) != 0) return fail("invalid file size");
         const size_t file_size = static_cast<size_t>(length);
+        if (vm->attempt_control && (file_size > 64 * 1048576 || !owned_attempt_poll(vm))) return fail("owned library budget");
         std::vector<uint8_t> buffer(file_size);
         if (fread(buffer.data(), 1, file_size, file.get()) != file_size) return fail("file read failed");
         file.reset();
@@ -1443,6 +1486,7 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
             (lib.init_arraysz && !translate(lib.metadata.init_array, lib.init_arraysz, lib.init_array)))
             return fail("invalid table address");
         for (size_t index = 0; index < lib.metadata.symbol_count; ++index) {
+            if (!owned_attempt_poll(vm)) return fail("attempt stopped");
             Elf64_Sym sym{};
             std::string symbol_name;
             if (!elf_metadata_bounds::symbol(lib.metadata, index, sym) ||
@@ -1469,6 +1513,7 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
             uint64_t remaining = segment.p_memsz - segment.p_filesz;
             const uint8_t zeros[4096] = {};
             while (remaining) {
+                if (!owned_attempt_poll(vm)) return fail("attempt stopped");
                 const size_t count = remaining < sizeof(zeros) ? static_cast<size_t>(remaining) : sizeof(zeros);
                 if (uc_mem_write(vm->uc, bss_address, zeros, count) != UC_ERR_OK) return fail("BSS write failed");
                 bss_address += count;
@@ -1560,6 +1605,12 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
         if (failure) failure->reason = vm && vm->initialization_failed ? Reason::PreviouslyFailed : Reason::InvalidVM;
         return -1;
     }
+    if (vm->attempt_control) {
+        const uint64_t remaining = vm->attempt_control->remaining_us();
+        if (!remaining) { vm->initialization_failed = true; return -1007; }
+        timeout_us = timeout_us ? std::min(timeout_us, remaining) : remaining;
+        max_count = max_count ? std::min(max_count, size_t(50000000)) : size_t(50000000);
+    }
     // V3_ISOLATED_ANISETTE_OTP_V1: a temporary VM must not leave a dangling fallback.
     struct ActiveVMScope {
         EmulatorVM *previous;
@@ -1617,7 +1668,9 @@ int32_t run_vm_procedure(EmulatorVM *vm, uint64_t proc_addr, const std::vector<u
     uint64_t pc = 0;
     const uc_err pc_status = uc_reg_read(vm->uc, UC_ARM64_REG_PC, &pc);
     if (err == UC_ERR_OK && pc_status != UC_ERR_OK) err = pc_status;
-    if (vm->initialization_failed || err != UC_ERR_OK || pc != kReturnAddress) {
+    if ((vm->attempt_control && !vm->attempt_control->completed(err == UC_ERR_OK, pc_status == UC_ERR_OK && pc == kReturnAddress)) ||
+        vm->initialization_failed || err != UC_ERR_OK || pc != kReturnAddress) {
+        if (vm->attempt_control) vm->initialization_failed = true;
         if (failure) {
             failure->reason = vm->unsupported_interrupt ? Reason::UnsupportedInterrupt :
                 (err != UC_ERR_OK ? Reason::EngineError : Reason::UnexpectedReturn);

@@ -43,6 +43,10 @@
 #include <algorithm>
 #include <errno.h>
 #include <chrono>
+#include <atomic>
+#include <array>
+#include <random>
+#include "Loader/owned_directory_cleanup.h"
 
 #define V3_TEMPORARY_ANISETTE_TRACE_ENABLED 1
 // DEBUG/TEMPORARY: remove after the Anisette failure is diagnosed.
@@ -294,11 +298,11 @@ struct CheckedAnisetteStagingFile {
 };
 
 static bool checked_anisette_staging(const char *root, const uint8_t *identifier,
-    const uint8_t *bytes, uint32_t length, NativeOTPTrace &trace, CheckedAnisetteStagingFailure &failure) {
+    const uint8_t *bytes, uint32_t length, NativeOTPTrace &trace, CheckedAnisetteStagingFailure &failure, int retained_root = -2) {
     CheckedAnisetteStagingFile owned;
     const std::string uuid = format_uuid_string(identifier);
     struct stat root_identity, directory_identity;
-    owned.root = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    owned.root = retained_root != -2 ? retained_root : open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (owned.root < 0) failure.record(errno);
     bool root_ok = owned.root >= 0;
     if (root_ok && fstat(owned.root, &root_identity) != 0) { failure.record(errno); root_ok = false; }
@@ -332,11 +336,11 @@ static bool checked_anisette_staging(const char *root, const uint8_t *identifier
     if (!destination_ok()) { trace.add(NativeOTPStage::FileOpenFailed); return false; }
     // The normal native mutex protects this counter. Never reuse another call's
     // leaf, including a partial file left behind by process termination.
-    static uint64_t next_temporary = 0;
+    static std::atomic<uint64_t> next_temporary{0};
     int descriptor = -1;
     for (unsigned attempt = 0; attempt < 16; ++attempt) {
         snprintf(owned.temporary_name, sizeof(owned.temporary_name), ".adi.pb.checked-%ld-%llu",
-            static_cast<long>(getpid()), static_cast<unsigned long long>(next_temporary++));
+            static_cast<long>(getpid()), static_cast<unsigned long long>(next_temporary.fetch_add(1, std::memory_order_relaxed)));
         descriptor = openat(owned.directory, owned.temporary_name,
             O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (descriptor >= 0) break;
@@ -453,7 +457,7 @@ static int checked_anisette_make_uuid_directory(const char *, const uint8_t *, C
     return -1;
 }
 static bool checked_anisette_staging(const char *, const uint8_t *, const uint8_t *, uint32_t, NativeOTPTrace &trace,
-    CheckedAnisetteStagingFailure &failure) {
+    CheckedAnisetteStagingFailure &failure, int = -2) {
     failure.record(0);
     trace.add(NativeOTPStage::FileOpenFailed);
     return false;
@@ -462,14 +466,26 @@ static bool checked_anisette_staging(const char *, const uint8_t *, const uint8_
 
 thread_local bool g_isolated_otp_logging_suppressed = false;
 
-static EmulatorVM *g_shared_vm = nullptr;
+// The legacy context remains serialized by its existing mutex. Owned attempts
+// select their own state on the calling worker and never swap legacy globals.
+struct AnisetteVMState {
+    EmulatorVM *vm = nullptr;
+    std::string provisioning_path, android_id;
+    bool libraries_initialized = false, initialization_failed = false;
+    bool session_active = false;
+    uint32_t session = 0;
+    std::shared_ptr<anisette_owned_attempt::Control> control;
+    std::shared_ptr<anisette_owned_attempt::Filesystem> filesystem;
+};
+static AnisetteVMState legacy_vm_state;
 static std::mutex g_vm_mutex;
-static std::string g_current_prov_path = "";
-static std::string g_current_android_id = "";
-static bool g_libraries_initialized = false;
-// A constructor can fail before a VM exists; retain that failure as well.
-// Accessed only while g_vm_mutex is held.
-static bool g_vm_initialization_failed = false;
+static thread_local AnisetteVMState *owned_vm_state = nullptr;
+static AnisetteVMState &current_vm_state() { return owned_vm_state ? *owned_vm_state : legacy_vm_state; }
+struct ScopedOwnedVMState {
+    AnisetteVMState *previous;
+    explicit ScopedOwnedVMState(AnisetteVMState &state) : previous(owned_vm_state) { owned_vm_state = &state; }
+    ~ScopedOwnedVMState() { owned_vm_state = previous; }
+};
 
 static bool setup_vm_and_adi(
     EmulatorVM *&vm,
@@ -488,29 +504,32 @@ static bool setup_vm_and_adi(
         return false;
     }
     struct stat st;
-    if (!normal_otp_staged && (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode))) {
+    if (!owned_vm_state && !normal_otp_staged && (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode))) {
         out_err = std::string("Provided library path is not a valid directory: ") + lib_dir;
         return false;
     }
 
-    if (g_vm_initialization_failed || (g_shared_vm && g_shared_vm->initialization_failed)) {
+    if (current_vm_state().initialization_failed || (current_vm_state().vm && current_vm_state().vm->initialization_failed)) {
         out_err = "VM initialization previously failed; restart required";
         return false;
     }
-    if (!g_shared_vm) {
+    if (!current_vm_state().vm) {
         NativeOTPStageScope init_stage(trace, NativeOTPStage::VMInitFailed);
-        try { g_shared_vm = new EmulatorVM(); }
+        try {
+            current_vm_state().vm = new EmulatorVM(false, current_vm_state().control);
+            current_vm_state().vm->attempt_filesystem = current_vm_state().filesystem;
+        }
         catch (const std::exception &) {
-            g_vm_initialization_failed = true;
+            current_vm_state().initialization_failed = true;
             out_err = "VM initialization failed";
             return false;
         }
         init_stage.finish(NativeOTPStage::VMInitOK);
     }
     else if (trace && !isolated) trace->add(NativeOTPStage::VMReused);
-    vm = g_shared_vm;
+    vm = current_vm_state().vm;
 
-    if (!g_libraries_initialized) {
+    if (!current_vm_state().libraries_initialized) {
         std::string lib_path(lib_dir);
         if (!lib_path.empty() && lib_path.back() != '/') lib_path += "/";
         std::string ssc_path     = lib_path + kADISymbols.lib_ssc;
@@ -559,7 +578,7 @@ static bool setup_vm_and_adi(
             return false;
         }
         load_call_timing.finish();
-        g_libraries_initialized = true;
+        current_vm_state().libraries_initialized = true;
         library_stage.finish(NativeOTPStage::LibraryInitOK);
     }
 
@@ -570,13 +589,13 @@ static bool setup_vm_and_adi(
     // Normal OTP already created and checked this child before any native setup.
     // Provisioning and isolated OTP retain their inherited setup behavior.
     if (!normal_otp_staged) {
-        const int directory_result = mkdir(out_uuid_prov_dir.c_str(), 0755);
+        const int directory_result = owned_vm_state ? current_vm_state().filesystem->mkdir(out_uuid_prov_dir) : mkdir(out_uuid_prov_dir.c_str(), 0755);
         const int directory_errno = errno;
         if (trace) trace->add(directory_result == 0 ? NativeOTPStage::DirectoryCreated :
             (directory_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
     }
 
-    if (out_uuid_prov_dir != g_current_prov_path) {
+    if (out_uuid_prov_dir != current_vm_state().provisioning_path) {
         NativeOTPStageScope path_stage(trace, NativeOTPStage::ProvisioningPathFailed);
         uint64_t set_prov_ptr = get_vm_symbol_address(vm, kADISymbols.set_provisioning_path);
         if (!set_prov_ptr) {
@@ -592,14 +611,14 @@ static bool setup_vm_and_adi(
             out_err = "ADISetProvisioningPath failed: " + std::to_string(prov_res);
             return false;
         }
-        g_current_prov_path = out_uuid_prov_dir;
+        current_vm_state().provisioning_path = out_uuid_prov_dir;
         path_stage.finish(NativeOTPStage::ProvisioningPathOK);
     }
 
     else if (trace) trace->add(NativeOTPStage::ProvisioningPathCached);
 
     std::string android_id = get_android_id_string(identifier);
-    if (android_id != g_current_android_id) {
+    if (android_id != current_vm_state().android_id) {
         NativeOTPStageScope id_stage(trace, NativeOTPStage::AndroidIDFailed);
         uint64_t set_id_ptr = get_vm_symbol_address(vm, kADISymbols.set_android_id);
         if (!set_id_ptr) {
@@ -615,7 +634,7 @@ static bool setup_vm_and_adi(
             out_err = "ADISetAndroidID failed: " + std::to_string(id_res);
             return false;
         }
-        g_current_android_id = android_id;
+        current_vm_state().android_id = android_id;
         id_stage.finish(NativeOTPStage::AndroidIDOK);
     }
 
@@ -652,7 +671,7 @@ static int32_t get_anisette_headers_uc_locked(
         // Keep invalid library paths ahead of any filesystem mutation and return
         // the inherited loader error. The original null guard remains above.
         struct stat st;
-        if (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (!owned_vm_state && (stat(lib_dir, &st) != 0 || !S_ISDIR(st.st_mode))) {
             trace.add(NativeOTPStage::SetupBegin);
             trace.add(NativeOTPStage::SetupFailed);
             err = std::string("Provided library path is not a valid directory: ") + lib_dir;
@@ -662,12 +681,12 @@ static int32_t get_anisette_headers_uc_locked(
         // Temporary ordering experiment under g_vm_mutex: stage the supplied
         // bytes before a cold VM can run constructors or initialize ADI. Reused
         // and freshly provisioned VMs keep their existing context and caches.
-        const int made = checked_anisette_make_uuid_directory(provisioning_dir, identifier, staging_failure);
+        const int made = owned_vm_state ? current_vm_state().filesystem->mkdir(std::string(provisioning_dir) + "/" + format_uuid_string(identifier)) : checked_anisette_make_uuid_directory(provisioning_dir, identifier, staging_failure);
         const int made_errno = errno;
         trace.add(made == 0 ? NativeOTPStage::DirectoryCreated :
             (made_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
         if ((made != 0 && made_errno != EEXIST) ||
-            !checked_anisette_staging(provisioning_dir, identifier, adi_pb, adi_pb_len, trace, staging_failure)) {
+            !checked_anisette_staging(provisioning_dir, identifier, adi_pb, adi_pb_len, trace, staging_failure, owned_vm_state ? current_vm_state().filesystem->duplicate_scratch() : -2)) {
             *out_json = strdup(("{\"error\":\"" + staging_failure.message() + "\"}").c_str());
             return -6;
         }
@@ -717,28 +736,28 @@ static int32_t get_anisette_headers_uc_locked(
     uint64_t final_mid_addr = 0, final_otp_addr = 0;
     uint32_t final_mid_len = 0, final_otp_len = 0;
     
-    if (uc_mem_read(vm->uc, mid_ptr, &final_mid_addr, 8) != UC_ERR_OK && isolated) {
+    if (uc_mem_read(vm->uc, mid_ptr, &final_mid_addr, 8) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
     }
-    if (uc_mem_read(vm->uc, mid_len_ptr, &final_mid_len, 4) != UC_ERR_OK && isolated) {
+    if (uc_mem_read(vm->uc, mid_len_ptr, &final_mid_len, 4) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
     }
-    if (uc_mem_read(vm->uc, otp_ptr, &final_otp_addr, 8) != UC_ERR_OK && isolated) {
+    if (uc_mem_read(vm->uc, otp_ptr, &final_otp_addr, 8) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
     }
-    if (uc_mem_read(vm->uc, otp_len_ptr, &final_otp_len, 4) != UC_ERR_OK && isolated) {
+    if (uc_mem_read(vm->uc, otp_len_ptr, &final_otp_len, 4) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
     }
 
-    if (isolated && (!final_mid_addr || !final_otp_addr || !final_mid_len || !final_otp_len ||
+    if ((isolated || owned_vm_state) && (!final_mid_addr || !final_otp_addr || !final_mid_len || !final_otp_len ||
                      final_mid_len > 4096 || final_otp_len > 4096)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
@@ -746,7 +765,7 @@ static int32_t get_anisette_headers_uc_locked(
     }
     std::vector<uint8_t> mid_data(final_mid_len);
     if (final_mid_len > 0 && final_mid_addr != 0) {
-        if (uc_mem_read(vm->uc, final_mid_addr, mid_data.data(), final_mid_len) != UC_ERR_OK && isolated) {
+        if (uc_mem_read(vm->uc, final_mid_addr, mid_data.data(), final_mid_len) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
@@ -755,7 +774,7 @@ static int32_t get_anisette_headers_uc_locked(
 
     std::vector<uint8_t> otp_data(final_otp_len);
     if (final_otp_len > 0 && final_otp_addr != 0) {
-        if (uc_mem_read(vm->uc, final_otp_addr, otp_data.data(), final_otp_len) != UC_ERR_OK && isolated) {
+        if (uc_mem_read(vm->uc, final_otp_addr, otp_data.data(), final_otp_len) != UC_ERR_OK && (isolated || owned_vm_state)) {
         trace.add(NativeOTPStage::NativeOutputFailed);
         *out_json = strdup("{\"error\":\"Isolated OTP output invalid\"}");
         return ANISETTE_ERR_INVALID_JSON_RESPONSE;
@@ -908,22 +927,22 @@ struct IsolatedOTPVM {
     std::unique_ptr<EmulatorVM> probe;
 
     IsolatedOTPVM()
-        : saved_vm(g_shared_vm), saved_initialized(g_libraries_initialized),
-          saved_initialization_failed(g_vm_initialization_failed),
+        : saved_vm(current_vm_state().vm), saved_initialized(current_vm_state().libraries_initialized),
+          saved_initialization_failed(current_vm_state().initialization_failed),
           probe(new EmulatorVM(true)) {
         probe->read_only_filesystem = true;
-        saved_path.swap(g_current_prov_path);
-        saved_id.swap(g_current_android_id);
-        g_shared_vm = probe.get();
-        g_libraries_initialized = false;
-        g_vm_initialization_failed = false;
+        saved_path.swap(current_vm_state().provisioning_path);
+        saved_id.swap(current_vm_state().android_id);
+        current_vm_state().vm = probe.get();
+        current_vm_state().libraries_initialized = false;
+        current_vm_state().initialization_failed = false;
     }
     ~IsolatedOTPVM() {
-        g_shared_vm = saved_vm;
-        g_current_prov_path.swap(saved_path);
-        g_current_android_id.swap(saved_id);
-        g_libraries_initialized = saved_initialized;
-        g_vm_initialization_failed = saved_initialization_failed;
+        current_vm_state().vm = saved_vm;
+        current_vm_state().provisioning_path.swap(saved_path);
+        current_vm_state().android_id.swap(saved_id);
+        current_vm_state().libraries_initialized = saved_initialized;
+        current_vm_state().initialization_failed = saved_initialization_failed;
         // probe is destroyed after restoring the regular provider's state.
     }
 };
@@ -976,7 +995,7 @@ int32_t get_anisette_headers_isolated_uc(
 #endif
 }
 
-int32_t start_provision_uc(
+static int32_t start_provision_uc_locked(
     const char *lib_dir,
     const char *provisioning_dir,
     const uint8_t *identifier,
@@ -992,7 +1011,6 @@ int32_t start_provision_uc(
     *out_json = nullptr;
     NativeOTPTrace trace(out_json);
     trace.add(NativeOTPStage::ArgumentsOK);
-    std::lock_guard<std::mutex> lock(g_vm_mutex);
 
     EmulatorVM *vm = nullptr;
     std::string uuid_prov_dir, err;
@@ -1039,7 +1057,7 @@ int32_t start_provision_uc(
     LOG_UC("[AnisetteKit - UC] phase=provisioning.start result=%d\n", (int)res);
 
     if (res != 0) {
-        rmdir(uuid_prov_dir.c_str());
+        if (!owned_vm_state) rmdir(uuid_prov_dir.c_str());
         std::stringstream ss;
         ss << "{\"error\":\"ADIProvisioningStart failed ("
            << get_anisette_error_description(res) << "): " << res << "\"}";
@@ -1052,18 +1070,24 @@ int32_t start_provision_uc(
     uint32_t final_cpim_len = 0;
     uint32_t session = 0;
 
-    uc_mem_read(vm->uc, cpim_ptr, &final_cpim_addr, 8);
-    uc_mem_read(vm->uc, cpim_len_ptr, &final_cpim_len, 4);
-    uc_mem_read(vm->uc, session_ptr, &session, 4);
+    const bool output_read = uc_mem_read(vm->uc, cpim_ptr, &final_cpim_addr, 8) == UC_ERR_OK &&
+        uc_mem_read(vm->uc, cpim_len_ptr, &final_cpim_len, 4) == UC_ERR_OK &&
+        uc_mem_read(vm->uc, session_ptr, &session, 4) == UC_ERR_OK;
+    if (owned_vm_state && !output_read) { current_vm_state().control->fail(); return ANISETTE_ERR_LOADER_FAILED; }
 
     LOG_UC("[AnisetteKit - UC] phase=provisioning.start output_present=%d cpim_bytes=%u\n", final_cpim_addr != 0, (unsigned)final_cpim_len);
     fflush(stdout);
 
+    if (owned_vm_state && (final_cpim_len == 0 || final_cpim_len > 1048576 || !final_cpim_addr)) {
+        current_vm_state().control->fail(); return ANISETTE_ERR_LOADER_FAILED;
+    }
     std::vector<uint8_t> cpim_data(final_cpim_len);
     if (final_cpim_len > 0 && final_cpim_addr != 0) {
-        uc_mem_read(vm->uc, final_cpim_addr, cpim_data.data(), final_cpim_len);
+        const uc_err copied = uc_mem_read(vm->uc, final_cpim_addr, cpim_data.data(), final_cpim_len);
+        if (owned_vm_state && copied != UC_ERR_OK) { current_vm_state().control->fail(); return ANISETTE_ERR_LOADER_FAILED; }
     }
 
+    if (owned_vm_state) { current_vm_state().session = session; current_vm_state().session_active = true; }
     std::string cpim_b64 = base64_encode(cpim_data.data(), final_cpim_len);
 
     std::stringstream ss;
@@ -1075,7 +1099,7 @@ int32_t start_provision_uc(
     return ANISETTE_OK;
 }
 
-int32_t end_provision_uc(
+static int32_t end_provision_uc_locked(
     const char *lib_dir,
     const char *provisioning_dir,
     const uint8_t *identifier,
@@ -1094,7 +1118,6 @@ int32_t end_provision_uc(
     *out_json = nullptr;
     NativeOTPTrace trace(out_json);
     trace.add(NativeOTPStage::ArgumentsOK);
-    std::lock_guard<std::mutex> lock(g_vm_mutex);
 
     EmulatorVM *vm = nullptr;
     std::string uuid_prov_dir, err;
@@ -1131,7 +1154,14 @@ int32_t end_provision_uc(
 
     operation_stage.finish(NativeOTPStage::NativeEndOK);
     std::string adi_pb_path = uuid_prov_dir + "/" + kADISymbols.adi_pb_filename;
-    FILE* f = fopen(adi_pb_path.c_str(), "rb");
+    FILE *f = nullptr;
+#if !defined(_WIN32) && !defined(_MSC_VER)
+    if (owned_vm_state) {
+        int fd = current_vm_state().filesystem->open(adi_pb_path, O_RDONLY, 0);
+        if (fd >= 0) { f = fdopen(fd, "rb"); if (!f) close(fd); }
+    } else
+#endif
+    { f = fopen(adi_pb_path.c_str(), "rb"); }
     if (!f) {
         *out_json = strdup("{\"error\":\"Failed to read generated adi.pb\"}");
         return ANISETTE_ERR_READ_FILE_FAILED;
@@ -1141,10 +1171,13 @@ int32_t end_provision_uc(
     size_t size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    if (owned_vm_state && (size == 0 || size > 1048576 || !current_vm_state().control->check())) { fclose(f); return ANISETTE_ERR_READ_FILE_FAILED; }
     std::vector<uint8_t> pb_data(size);
-    fread(pb_data.data(), 1, size, f);
-    fclose(f);
+    const bool read_ok = fread(pb_data.data(), 1, size, f) == size;
+    const bool close_ok = fclose(f) == 0;
+    if (owned_vm_state && (!read_ok || !close_ok)) return ANISETTE_ERR_READ_FILE_FAILED;
 
+    if (owned_vm_state) current_vm_state().session_active = false;
     std::string adi_pb_b64 = base64_encode(pb_data.data(), size);
 
     std::stringstream ss;
@@ -1154,6 +1187,17 @@ int32_t end_provision_uc(
     trace.add(NativeOTPStage::NativeOutputUnchecked);
     if (!*out_json) trace.add(NativeOTPStage::ResponseAllocationFailed);
     return ANISETTE_OK;
+}
+
+int32_t start_provision_uc(const char *lib, const char *root, const uint8_t *id,
+    const uint8_t *spim, uint32_t length, char **out) {
+    std::lock_guard<std::mutex> lock(g_vm_mutex);
+    return start_provision_uc_locked(lib, root, id, spim, length, out);
+}
+int32_t end_provision_uc(const char *lib, const char *root, const uint8_t *id,
+    uint32_t session, const uint8_t *ptm, uint32_t ptm_length, const uint8_t *tk, uint32_t tk_length, char **out) {
+    std::lock_guard<std::mutex> lock(g_vm_mutex);
+    return end_provision_uc_locked(lib, root, id, session, ptm, ptm_length, tk, tk_length, out);
 }
 
 int32_t cancel_provision_uc(
@@ -1169,14 +1213,202 @@ int32_t cancel_provision_uc(
 
     std::lock_guard<std::mutex> lock(g_vm_mutex);
 
-    if (g_shared_vm) {
-        uint64_t destroy_session_ptr = get_vm_symbol_address(g_shared_vm, kADISymbols.destroy_session);
+    if (current_vm_state().vm) {
+        uint64_t destroy_session_ptr = get_vm_symbol_address(current_vm_state().vm, kADISymbols.destroy_session);
         if (destroy_session_ptr) {
-            run_vm_procedure(g_shared_vm, destroy_session_ptr, {session});
+            run_vm_procedure(current_vm_state().vm, destroy_session_ptr, {session});
         }
     }
 
     return ANISETTE_OK;
+}
+
+// ABI ownership: callers retain a handle until every call and cancellation
+// callback returns. Every dispatched call takes an additional native reference.
+struct AnisetteOwnedAttempt {
+    std::atomic<unsigned> references{1};
+    AnisetteVMState state;
+    std::string library, directory, root;
+    bool libraries_staged = false;
+    std::array<uint8_t,16> identity{};
+    int parent_fd = -1, root_fd = -1;
+    std::string root_name;
+    std::atomic<bool> cleaned{false};
+    std::atomic<bool> cleanup_ok{false};
+    std::mutex cleanup_mutex;
+    explicit AnisetteOwnedAttempt(uint32_t milliseconds) {
+        state.control = std::make_shared<anisette_owned_attempt::Control>(std::chrono::milliseconds(milliseconds));
+        state.filesystem = std::make_shared<anisette_owned_attempt::Filesystem>();
+    }
+    bool cleanup() noexcept {
+        state.control->close();
+        if (!state.control->quiescent()) return false;
+        std::lock_guard<std::mutex> lock(cleanup_mutex);
+        if (cleaned.load(std::memory_order_acquire)) return cleanup_ok.load(std::memory_order_acquire);
+        delete state.vm; state.vm = nullptr;
+        state.filesystem.reset();
+        bool okay = true;
+#if !defined(_WIN32) && !defined(_MSC_VER)
+        if (!root.empty()) {
+            okay = parent_fd >= 0 && root_fd >= 0 &&
+                anisette_owned_attempt::remove_owned_root(parent_fd, root_name, root_fd);
+        }
+        if (root_fd >= 0) { if (close(root_fd) != 0) okay = false; root_fd = -1; }
+        if (parent_fd >= 0) { if (close(parent_fd) != 0) okay = false; parent_fd = -1; }
+#endif
+        cleanup_ok.store(okay, std::memory_order_release);
+        cleaned.store(true, std::memory_order_release);
+        return okay;
+    }
+    ~AnisetteOwnedAttempt() { cleanup(); }
+};
+
+AnisetteOwnedAttempt *anisette_owned_attempt_create(const char *library, const char *scratch_parent,
+    const uint8_t *identity, uint32_t milliseconds) {
+#if defined(_WIN32) || defined(_MSC_VER)
+    (void)library; (void)scratch_parent; (void)identity; (void)milliseconds; return nullptr;
+#else
+    if (!library || !scratch_parent || !identity || milliseconds == 0 || milliseconds > 120000) return nullptr;
+    try {
+        std::unique_ptr<AnisetteOwnedAttempt> attempt(new AnisetteOwnedAttempt(milliseconds));
+        char *canonical_library = realpath(library, nullptr);
+        char *canonical_parent = realpath(scratch_parent, nullptr);
+        if (!canonical_library || !canonical_parent) { free(canonical_library); free(canonical_parent); return nullptr; }
+        attempt->library = canonical_library;
+        std::string parent(canonical_parent);
+        free(canonical_library); free(canonical_parent);
+        struct stat parent_stat{};
+        if (lstat(parent.c_str(), &parent_stat) != 0 || !S_ISDIR(parent_stat.st_mode) || parent_stat.st_uid != geteuid() || (parent_stat.st_mode & 0077) != 0) return nullptr;
+        attempt->parent_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct stat held_parent{};
+        if (attempt->parent_fd < 0 || fstat(attempt->parent_fd, &held_parent) != 0 || held_parent.st_dev != parent_stat.st_dev || held_parent.st_ino != parent_stat.st_ino) return nullptr;
+        std::random_device random;
+        std::ostringstream name; name << "owned-anisette-" << std::hex;
+        for (unsigned i=0;i<4;++i) name << random();
+        attempt->root_name=name.str();
+        if (mkdirat(attempt->parent_fd,attempt->root_name.c_str(),0700)!=0) return nullptr;
+        attempt->root = parent + "/" + attempt->root_name;
+        attempt->directory = attempt->root + "/state";
+        attempt->root_fd = openat(attempt->parent_fd, attempt->root_name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (attempt->root_fd < 0 || !anisette_owned_attempt::same_directory_at(attempt->parent_fd, attempt->root_name.c_str(), attempt->root_fd)) return nullptr;
+        if (mkdirat(attempt->root_fd,"state",0700)!=0) return nullptr;
+        std::copy(identity, identity + 16, attempt->identity.begin());
+        return attempt.release();
+    } catch (...) { return nullptr; }
+#endif
+}
+int32_t anisette_owned_attempt_stage_libraries(AnisetteOwnedAttempt *attempt,
+    const uint8_t *ssc, uint32_t ssc_length, const uint8_t *adi, uint32_t adi_length) {
+#if defined(_WIN32) || defined(_MSC_VER)
+    (void)attempt; (void)ssc; (void)ssc_length; (void)adi; (void)adi_length; return ANISETTE_ERR_INVALID_ARGUMENT;
+#else
+    if (!attempt || !ssc || !adi || !ssc_length || !adi_length || ssc_length > 64 * 1048576 || adi_length > 64 * 1048576)
+        return ANISETTE_ERR_INVALID_ARGUMENT;
+    anisette_owned_attempt::Call call(*attempt->state.control);
+    if (!call || attempt->libraries_staged || attempt->state.vm) return -8;
+    const std::string library = attempt->root + "/libraries";
+    if (mkdirat(attempt->root_fd, "libraries", 0700) != 0) return ANISETTE_ERR_LOADER_FAILED;
+    int library_fd = openat(attempt->root_fd,"libraries",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    int state_fd = openat(attempt->root_fd,"state",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct Descriptors { int a,b; ~Descriptors(){if(a>=0)close(a);if(b>=0)close(b);} } descriptors{library_fd,state_fd};
+    if(library_fd<0 || state_fd<0) return ANISETTE_ERR_LOADER_FAILED;
+    const auto stage = [&](const char *name, const uint8_t *bytes, uint32_t length) {
+        int fd = openat(library_fd,name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0400);
+        if (fd < 0) return false;
+        bool okay = true;
+        for (uint32_t offset = 0; offset < length;) {
+            if (!attempt->state.control->check()) { okay = false; break; }
+            const uint32_t count = std::min(uint32_t(65536), length - offset);
+            ssize_t written = write(fd, bytes + offset, count);
+            if (written <= 0) { okay = false; break; }
+            offset += static_cast<uint32_t>(written);
+        }
+        if (close(fd) != 0) okay = false;
+        if (!okay) unlinkat(library_fd,name,0);
+        return okay;
+    };
+    if (!stage(kADISymbols.lib_ssc, ssc, ssc_length) || !stage(kADISymbols.lib_core_adi, adi, adi_length) ||
+        !attempt->state.filesystem->configure_descriptors(attempt->directory, library, state_fd, library_fd)) {
+        attempt->state.control->fail(); return ANISETTE_ERR_LOADER_FAILED;
+    }
+    attempt->library = library;
+    attempt->libraries_staged = true;
+    return ANISETTE_OK;
+#endif
+}
+const char *anisette_owned_attempt_library_directory(AnisetteOwnedAttempt *attempt) {
+    return attempt && attempt->libraries_staged ? attempt->library.c_str() : nullptr;
+}
+void anisette_owned_attempt_retain(AnisetteOwnedAttempt *attempt) {
+    if (attempt) attempt->references.fetch_add(1, std::memory_order_relaxed);
+}
+void anisette_owned_attempt_release(AnisetteOwnedAttempt *attempt) {
+    if (attempt && attempt->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete attempt;
+}
+void anisette_owned_attempt_cancel(AnisetteOwnedAttempt *attempt) {
+    if (attempt) attempt->state.control->cancel();
+}
+const char *anisette_owned_attempt_directory(AnisetteOwnedAttempt *attempt) { return attempt ? attempt->directory.c_str() : nullptr; }
+int32_t anisette_owned_attempt_finish(AnisetteOwnedAttempt *attempt) {
+    if (!attempt) return ANISETTE_ERR_INVALID_ARGUMENT;
+    if (attempt->cleanup()) return ANISETTE_OK;
+    return attempt->state.control->quiescent() ? -6 : -8;
+}
+int32_t anisette_owned_attempt_is_quiescent(AnisetteOwnedAttempt *attempt) {
+    return attempt && attempt->state.control->quiescent() && attempt->cleaned.load(std::memory_order_acquire);
+}
+
+static int32_t owned_attempt_call(AnisetteOwnedAttempt *attempt, int operation,
+    const uint8_t *first, uint32_t first_length, const uint8_t *second, uint32_t second_length,
+    uint32_t session, char **out) {
+    if (!out) return ANISETTE_ERR_INVALID_ARGUMENT;
+    *out = nullptr;
+    if (!attempt || !first || first_length == 0 || first_length > 1048576 || second_length > 1048576 ||
+        (operation == 2 && (!second || second_length == 0))) return ANISETTE_ERR_INVALID_ARGUMENT;
+    anisette_owned_attempt_retain(attempt);
+    struct Reference { AnisetteOwnedAttempt *value; ~Reference() { anisette_owned_attempt_release(value); } } reference{attempt};
+    anisette_owned_attempt::Call call(*attempt->state.control);
+    if (!call) return -8;
+    if (!attempt->libraries_staged) return ANISETTE_ERR_INVALID_ARGUMENT;
+    IsolatedOTPLogging logging;
+    ScopedOwnedVMState state(attempt->state);
+    try {
+        int32_t result;
+        if (operation == 0) {
+            if (attempt->state.filesystem->mkdir(attempt->directory + "/" + format_uuid_string(attempt->identity.data())) != 0) return ANISETTE_ERR_LOADER_FAILED;
+            NativeOTPTrace trace(out);
+            result = get_anisette_headers_uc_locked(attempt->library.c_str(), attempt->directory.c_str(),
+                attempt->identity.data(), first, first_length, out, false, trace);
+        } else if (operation == 1) {
+            if (attempt->state.session_active) return ANISETTE_ERR_INVALID_ARGUMENT;
+            result = start_provision_uc_locked(attempt->library.c_str(), attempt->directory.c_str(),
+                attempt->identity.data(), first, first_length, out);
+        } else {
+            if (!attempt->state.session_active || attempt->state.session != session) return ANISETTE_ERR_INVALID_ARGUMENT;
+            result = end_provision_uc_locked(attempt->library.c_str(), attempt->directory.c_str(),
+                attempt->identity.data(), session, first, first_length, second, second_length, out);
+        }
+        if (!attempt->state.control->check() || result != ANISETTE_OK || !*out) {
+            attempt->state.control->fail();
+            if (*out) { free_c_string(*out); *out = nullptr; }
+            return result == ANISETTE_OK ? -8 : result;
+        }
+        return result;
+    } catch (...) {
+        attempt->state.control->fail();
+        if (*out) { free_c_string(*out); *out = nullptr; }
+        return ANISETTE_ERR_LOADER_FAILED;
+    }
+}
+int32_t anisette_owned_attempt_headers(AnisetteOwnedAttempt *attempt, const uint8_t *blob, uint32_t length, char **out) {
+    return owned_attempt_call(attempt, 0, blob, length, nullptr, 0, 0, out);
+}
+int32_t anisette_owned_attempt_start(AnisetteOwnedAttempt *attempt, const uint8_t *spim, uint32_t length, char **out) {
+    return owned_attempt_call(attempt, 1, spim, length, nullptr, 0, 0, out);
+}
+int32_t anisette_owned_attempt_end(AnisetteOwnedAttempt *attempt, uint32_t session, const uint8_t *ptm, uint32_t ptm_length,
+    const uint8_t *tk, uint32_t tk_length, char **out) {
+    return owned_attempt_call(attempt, 2, ptm, ptm_length, tk, tk_length, session, out);
 }
 
 }

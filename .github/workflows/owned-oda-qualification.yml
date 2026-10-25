@@ -1,0 +1,97 @@
+name: Owned ODA synthetic qualification
+on:
+  push:
+    branches: [feature/owned-oda-attempt]
+    paths:
+      - 'Native/**'
+      - 'Sources/**'
+      - 'Tests/AnisetteKitTests/OwnedOnDeviceAnisetteAttemptTests.swift'
+      - '.ci/owned-attempt/**'
+      - 'Package.swift'
+      - '.github/workflows/owned-oda-qualification.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: owned-oda-qualification-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  synthetic-owned-attempt:
+    if: github.repository == 'NRG-Wardog/AnisetteKit' && github.ref == 'refs/heads/feature/owned-oda-attempt'
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record exact toolchain and source
+        id: prepare
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD HEAD^{tree} > evidence/source.txt
+          xcodebuild -version | tee evidence/xcode.txt
+          grep -Fx "Xcode 26.4.1" evidence/xcode.txt
+          swift --version | tee evidence/swift.txt
+          c++ --version | tee evidence/cxx.txt
+          python3 --version | tee evidence/python.txt
+      - name: Download and verify already-pinned Unicorn artifact
+        id: dependency
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, pathlib, re, subprocess
+          manifest=pathlib.Path('Package.swift').read_text()
+          url=re.search(r'url: "(https://github.com/mahee96/unicorn/releases/download/[^"#]+)(?:#AnisetteKit)?"',manifest).group(1)
+          checksum=re.search(r'checksum: "([a-f0-9]{64})"',manifest).group(1)
+          assert checksum=='52e4ac9e2d704c4941adc2c381df8706aabf673dc843611a90b33ad349d562db'
+          archive=pathlib.Path('evidence/Unicorn.xcframework.zip')
+          subprocess.run(['curl','--fail','--location','--proto','=https','--max-time','240','--output',str(archive),url],check=True,timeout=250)
+          actual=hashlib.sha256(archive.read_bytes()).hexdigest()
+          assert actual==checksum, 'Pinned archive checksum mismatch'
+          pathlib.Path('evidence/unicorn-sha256.txt').write_text(actual+'\n')
+          PY
+      - name: Native ownership and pinned real Unicorn synthetic fixtures
+        id: native
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 .ci/owned-attempt/run.py --unicorn-archive evidence/Unicorn.xcframework.zip 2>&1 | tee evidence/native.log
+      - name: Owned Swift fixtures only, no online provisioning tests
+        id: swift
+        if: ${{ !cancelled() && steps.dependency.outcome == 'success' && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          swift test --filter OwnedOnDeviceAnisetteAttemptTests 2>&1 | tee evidence/swift-tests.log
+      - name: Write attempt receipt
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          NATIVE_OUTCOME: ${{ steps.native.outcome }}
+          SWIFT_OUTCOME: ${{ steps.swift.outcome }}
+          DEPENDENCY_OUTCOME: ${{ steps.dependency.outcome }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          keys=['SOURCE_SHA','RUN_ID','RUN_ATTEMPT','NATIVE_OUTCOME','SWIFT_OUTCOME','DEPENDENCY_OUTCOME']
+          receipt={key:os.environ[key] for key in keys}
+          receipt['scope']='Synthetic native and URLProtocol fixtures only; no device or Apple authentication claim'
+          pathlib.Path('evidence/attempt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          PY
+      - name: Retain non-secret qualification evidence
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: owned-oda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/*.txt
+            evidence/*.log
+            evidence/attempt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -15,6 +15,28 @@
 extern "C" {
 #endif
 
+// Opt-in isolated attempt API. Retain until all calls/cancel callbacks return.
+// cancel only marks state. finish returns -8 while native work has not drained;
+// do not free/reuse scratch or advance providers until is_quiescent is true.
+typedef struct AnisetteOwnedAttempt AnisetteOwnedAttempt;
+AnisetteOwnedAttempt *anisette_owned_attempt_create(const char *library, const char *scratch_parent,
+    const uint8_t *identity, uint32_t milliseconds);
+// Bytes must already match the caller's reviewed asset hashes. Copies are private
+// and immutable to guest writes; staging is mandatory before all operations.
+int32_t anisette_owned_attempt_stage_libraries(AnisetteOwnedAttempt *attempt, const uint8_t *ssc,
+    uint32_t ssc_length, const uint8_t *adi, uint32_t adi_length);
+const char *anisette_owned_attempt_library_directory(AnisetteOwnedAttempt *attempt);
+void anisette_owned_attempt_retain(AnisetteOwnedAttempt *attempt);
+void anisette_owned_attempt_release(AnisetteOwnedAttempt *attempt);
+void anisette_owned_attempt_cancel(AnisetteOwnedAttempt *attempt);
+const char *anisette_owned_attempt_directory(AnisetteOwnedAttempt *attempt);
+int32_t anisette_owned_attempt_finish(AnisetteOwnedAttempt *attempt);
+int32_t anisette_owned_attempt_is_quiescent(AnisetteOwnedAttempt *attempt);
+int32_t anisette_owned_attempt_headers(AnisetteOwnedAttempt *attempt, const uint8_t *blob, uint32_t length, char **out);
+int32_t anisette_owned_attempt_start(AnisetteOwnedAttempt *attempt, const uint8_t *spim, uint32_t length, char **out);
+int32_t anisette_owned_attempt_end(AnisetteOwnedAttempt *attempt, uint32_t session, const uint8_t *ptm,
+    uint32_t ptm_length, const uint8_t *tk, uint32_t tk_length, char **out);
+
 typedef enum {
     ANISETTE_OK                            = 0,
     ANISETTE_ERR_INVALID_ARGUMENT          = -1,
