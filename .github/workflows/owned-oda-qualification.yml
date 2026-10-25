@@ -7,6 +7,7 @@ on:
       - 'Sources/**'
       - 'Tests/AnisetteKitTests/OwnedOnDeviceAnisetteAttemptTests.swift'
       - '.ci/owned-attempt/**'
+      - '.ci/native-tests/**'
       - 'Package.swift'
       - '.github/workflows/owned-oda-qualification.yml'
   workflow_dispatch:
@@ -60,6 +61,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 .ci/owned-attempt/run.py --unicorn-archive evidence/Unicorn.xcframework.zip 2>&1 | tee evidence/native.log
+          python3 .ci/native-tests/run_tests.py 2>&1 | tee evidence/legacy-boundaries.log
+      - name: Verify recognized Apple libraries and qualify local native startup
+        id: startup
+        if: ${{ !cancelled() && steps.native.outcome == 'success' && steps.dependency.outcome == 'success' }}
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          curl --fail --location --proto '=https' --max-time 240 --max-filesize 142139820 --output evidence/applemusic.apk https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk
+          python3 .ci/owned-attempt/run_verified_startup.py --archive evidence/applemusic.apk --unicorn-archive evidence/Unicorn.xcframework.zip --receipt evidence/trusted-startup.json 2>&1 | tee evidence/trusted-startup.log
       - name: Owned Swift fixtures only, no online provisioning tests
         id: swift
         if: ${{ !cancelled() && steps.dependency.outcome == 'success' && steps.prepare.outcome == 'success' }}
@@ -67,21 +77,31 @@ jobs:
         run: |
           set -euo pipefail
           swift test --filter OwnedOnDeviceAnisetteAttemptTests 2>&1 | tee evidence/swift-tests.log
+          python3 - <<'PYCODE'
+          import pathlib, re
+          source=pathlib.Path('Tests/AnisetteKitTests/OwnedOnDeviceAnisetteAttemptTests.swift').read_text()
+          tests=re.findall(r'^    func (test\w+)\(',source,re.M)
+          log=pathlib.Path('evidence/swift-tests.log').read_text()
+          assert len(tests)==7, 'Owned test inventory changed without review'
+          for test in tests:
+              assert re.search(r'^Test Case .*'+re.escape(test)+r'(?![A-Za-z0-9_]).* passed \(',log,re.M), 'Missing passed XCTest: '+test
+          PYCODE
       - name: Write attempt receipt
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         env:
           NATIVE_OUTCOME: ${{ steps.native.outcome }}
           SWIFT_OUTCOME: ${{ steps.swift.outcome }}
           DEPENDENCY_OUTCOME: ${{ steps.dependency.outcome }}
+          STARTUP_OUTCOME: ${{ steps.startup.outcome }}
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib
-          keys=['SOURCE_SHA','RUN_ID','RUN_ATTEMPT','NATIVE_OUTCOME','SWIFT_OUTCOME','DEPENDENCY_OUTCOME']
+          keys=['SOURCE_SHA','RUN_ID','RUN_ATTEMPT','NATIVE_OUTCOME','SWIFT_OUTCOME','DEPENDENCY_OUTCOME','STARTUP_OUTCOME']
           receipt={key:os.environ[key] for key in keys}
-          receipt['scope']='Synthetic native and URLProtocol fixtures only; no device or Apple authentication claim'
+          receipt['scope']='Synthetic native/URLProtocol fixtures and verified-library startup with invalid synthetic blob; no device or Apple authentication claim'
           pathlib.Path('evidence/attempt.json').write_text(json.dumps(receipt,indent=2)+'\n')
           PY
       - name: Retain non-secret qualification evidence
@@ -92,6 +112,6 @@ jobs:
           path: |
             evidence/*.txt
             evidence/*.log
-            evidence/attempt.json
+            evidence/*.json
           if-no-files-found: error
           retention-days: 7

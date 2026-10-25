@@ -589,7 +589,7 @@ static bool setup_vm_and_adi(
     // Normal OTP already created and checked this child before any native setup.
     // Provisioning and isolated OTP retain their inherited setup behavior.
     if (!normal_otp_staged) {
-        const int directory_result = owned_vm_state ? current_vm_state().filesystem->mkdir(out_uuid_prov_dir) : mkdir(out_uuid_prov_dir.c_str(), 0755);
+        const int directory_result = owned_vm_state ? current_vm_state().filesystem->create_directory(out_uuid_prov_dir) : mkdir(out_uuid_prov_dir.c_str(), 0755);
         const int directory_errno = errno;
         if (trace) trace->add(directory_result == 0 ? NativeOTPStage::DirectoryCreated :
             (directory_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
@@ -681,7 +681,7 @@ static int32_t get_anisette_headers_uc_locked(
         // Temporary ordering experiment under g_vm_mutex: stage the supplied
         // bytes before a cold VM can run constructors or initialize ADI. Reused
         // and freshly provisioned VMs keep their existing context and caches.
-        const int made = owned_vm_state ? current_vm_state().filesystem->mkdir(std::string(provisioning_dir) + "/" + format_uuid_string(identifier)) : checked_anisette_make_uuid_directory(provisioning_dir, identifier, staging_failure);
+        const int made = owned_vm_state ? current_vm_state().filesystem->create_directory(std::string(provisioning_dir) + "/" + format_uuid_string(identifier)) : checked_anisette_make_uuid_directory(provisioning_dir, identifier, staging_failure);
         const int made_errno = errno;
         trace.add(made == 0 ? NativeOTPStage::DirectoryCreated :
             (made_errno == EEXIST ? NativeOTPStage::DirectoryExists : NativeOTPStage::DirectoryFailed));
@@ -1157,7 +1157,7 @@ static int32_t end_provision_uc_locked(
     FILE *f = nullptr;
 #if !defined(_WIN32) && !defined(_MSC_VER)
     if (owned_vm_state) {
-        int fd = current_vm_state().filesystem->open(adi_pb_path, O_RDONLY, 0);
+        int fd = current_vm_state().filesystem->open_file(adi_pb_path, O_RDONLY, 0);
         if (fd >= 0) { f = fdopen(fd, "rb"); if (!f) close(fd); }
     } else
 #endif
@@ -1271,12 +1271,11 @@ AnisetteOwnedAttempt *anisette_owned_attempt_create(const char *library, const c
     if (!library || !scratch_parent || !identity || milliseconds == 0 || milliseconds > 120000) return nullptr;
     try {
         std::unique_ptr<AnisetteOwnedAttempt> attempt(new AnisetteOwnedAttempt(milliseconds));
-        char *canonical_library = realpath(library, nullptr);
-        char *canonical_parent = realpath(scratch_parent, nullptr);
-        if (!canonical_library || !canonical_parent) { free(canonical_library); free(canonical_parent); return nullptr; }
-        attempt->library = canonical_library;
-        std::string parent(canonical_parent);
-        free(canonical_library); free(canonical_parent);
+        std::unique_ptr<char, decltype(&free)> canonical_library(realpath(library, nullptr), &free);
+        std::unique_ptr<char, decltype(&free)> canonical_parent(realpath(scratch_parent, nullptr), &free);
+        if (!canonical_library || !canonical_parent) return nullptr;
+        attempt->library = canonical_library.get();
+        std::string parent(canonical_parent.get());
         struct stat parent_stat{};
         if (lstat(parent.c_str(), &parent_stat) != 0 || !S_ISDIR(parent_stat.st_mode) || parent_stat.st_uid != geteuid() || (parent_stat.st_mode & 0077) != 0) return nullptr;
         attempt->parent_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1306,6 +1305,7 @@ int32_t anisette_owned_attempt_stage_libraries(AnisetteOwnedAttempt *attempt,
         return ANISETTE_ERR_INVALID_ARGUMENT;
     anisette_owned_attempt::Call call(*attempt->state.control);
     if (!call || attempt->libraries_staged || attempt->state.vm) return -8;
+    try {
     const std::string library = attempt->root + "/libraries";
     if (mkdirat(attempt->root_fd, "libraries", 0700) != 0) return ANISETTE_ERR_LOADER_FAILED;
     int library_fd = openat(attempt->root_fd,"libraries",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
@@ -1334,6 +1334,10 @@ int32_t anisette_owned_attempt_stage_libraries(AnisetteOwnedAttempt *attempt,
     attempt->library = library;
     attempt->libraries_staged = true;
     return ANISETTE_OK;
+    } catch (...) {
+        attempt->state.control->fail();
+        return ANISETTE_ERR_LOADER_FAILED;
+    }
 #endif
 }
 const char *anisette_owned_attempt_library_directory(AnisetteOwnedAttempt *attempt) {
@@ -1375,7 +1379,7 @@ static int32_t owned_attempt_call(AnisetteOwnedAttempt *attempt, int operation,
     try {
         int32_t result;
         if (operation == 0) {
-            if (attempt->state.filesystem->mkdir(attempt->directory + "/" + format_uuid_string(attempt->identity.data())) != 0) return ANISETTE_ERR_LOADER_FAILED;
+            if (attempt->state.filesystem->create_directory(attempt->directory + "/" + format_uuid_string(attempt->identity.data())) != 0) return ANISETTE_ERR_LOADER_FAILED;
             NativeOTPTrace trace(out);
             result = get_anisette_headers_uc_locked(attempt->library.c_str(), attempt->directory.c_str(),
                 attempt->identity.data(), first, first_length, out, false, trace);

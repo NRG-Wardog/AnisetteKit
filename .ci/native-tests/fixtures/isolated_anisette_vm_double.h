@@ -7,10 +7,14 @@
 #include <cstring>
 #include <cstdint>
 #include <stdexcept>
+#include <memory>
+#include "owned_attempt_lifecycle.h"
+#include "owned_attempt_filesystem.h"
 #include "anisette_base.h"
 #include "vm_initialization_diagnostics.h"
 extern thread_local bool g_isolated_otp_logging_suppressed;
 #define LOG_UC(...) do { if (!g_isolated_otp_logging_suppressed) anisetteCoreLog(__VA_ARGS__); } while (0)
+using uc_err = int;
 constexpr int UC_ERR_OK = 0;
 struct uc_engine { std::map<uint64_t, std::vector<uint8_t>> memory; };
 inline int uc_mem_write(uc_engine *uc, uint64_t addr, const void *data, size_t len) {
@@ -27,12 +31,14 @@ extern std::string fault, expected_blob, expected_uuid, observed_id;
 extern bool stage_observed, require_bounded;
 void observe_native_checkpoint(const char *checkpoint);
 struct EmulatorVM {
+    std::shared_ptr<anisette_owned_attempt::Control> attempt_control;
+    std::shared_ptr<anisette_owned_attempt::Filesystem> attempt_filesystem;
     bool initialization_failed = false;
     bool read_only_filesystem = false;
     uc_engine *uc;
     PageAllocator heap;
     std::string provisioning_path;
-    explicit EmulatorVM(bool checked = false) {
+    explicit EmulatorVM(bool checked = false, std::shared_ptr<anisette_owned_attempt::Control> control = {}) : attempt_control(std::move(control)) {
         observe_native_checkpoint("vm.construct");
         if (checked && fault == "construct") throw std::runtime_error("synthetic");
         uc = new uc_engine; ++constructed;

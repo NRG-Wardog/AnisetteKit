@@ -9,11 +9,15 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
+#include <memory>
+#include <sys/stat.h>
+#include "owned_attempt_lifecycle.h"
+#include "owned_attempt_filesystem.h"
 #define LOG_UC(...) ((void)0)
 #define UC_ERR_OK 0
 enum {UC_ARM64_REG_X0,UC_ARM64_REG_X1,UC_ARM64_REG_X2};
 struct Fake {uint64_t r[3]={}; unsigned char mem[4096]={}; bool fail_copy=false;};
-struct EmulatorVM {Fake *uc; uint64_t errno_addr=0x10010; bool initialization_failed=false; int next_guest_fd=10;std::unordered_map<int,int> fd_map;};
+struct EmulatorVM {Fake *uc; std::shared_ptr<anisette_owned_attempt::Control> attempt_control; std::shared_ptr<anisette_owned_attempt::Filesystem> attempt_filesystem; uint64_t attempt_written_bytes=0; uint64_t errno_addr=0x10010; bool initialization_failed=false; int next_guest_fd=10;std::unordered_map<int,int> fd_map;};
 int uc_reg_read(Fake*u,int r,void*p){memcpy(p,&u->r[r],8);return 0;}
 int uc_reg_write(Fake*u,int r,const void*p){memcpy(&u->r[r],p,8);return 0;}
 int uc_mem_read(Fake*u,uint64_t a,void*p,size_t n){if(a<0x10000)return 1;a-=0x10000;if(a+n>4096)return 1;memcpy(p,u->mem+a,n);return 0;}

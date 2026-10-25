@@ -35,3 +35,21 @@ Ownership review scope:
 
 A blocked regular-file syscall can delay drain. No timeout claims that such a
 worker is quiescent; no thread killing or early VM destruction is used.
+
+## Trusted built-in startup compatibility
+
+After synthetic native success, the focused workflow downloads the existing
+recognized Apple Music APK from Apple's HTTPS endpoint. The APK byte count is
+checked and its observed SHA is recorded, not represented as an independently
+expected APK digest. Only the two reviewed library entries are extracted after
+unique-entry, exact-size and exact SHA256 checks. The C++ fixture checks those
+same immutable byte buffers again immediately before native staging.
+
+`run_verified_startup.py` then runs the actual pinned engine and actual core with
+a random synthetic UUID and deliberately invalid three-byte blob. It requires
+library initialization, provisioning-path and Android-ID setup, invalid-input
+rejection, native drain and owned cleanup. The fixture contains no account or
+network transport. This is startup/syscall compatibility, not successful Apple
+provisioning, authentication or device validation. The external fixture timeout
+is 90 seconds, independent of the 60-second native budget. Receipts contain only
+fixed outcomes, synthetic-fixture diagnostics and verified dependency digests.

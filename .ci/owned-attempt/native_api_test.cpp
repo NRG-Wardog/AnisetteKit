@@ -8,7 +8,19 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <new>
+#include <cstdlib>
 
+// Inject one actual C++ allocation failure after attempt construction, proving
+// the C ABI never unwinds through its Swift caller and still owns cleanup.
+static std::atomic<bool> fail_next_allocation{false};
+void *operator new(std::size_t size) {
+    if(fail_next_allocation.exchange(false)) throw std::bad_alloc();
+    if(void *p=std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 static std::mutex mutex;
 static std::condition_variable condition;
 static bool block_open = false, open_entered = false, release_open = false;
@@ -68,6 +80,15 @@ int main() {
     assert(result!=0); assert(anisette_owned_attempt_finish(second)==0);
     assert(anisette_owned_attempt_is_quiescent(second)); assert(!std::filesystem::exists(second_dir));
     assert(anisette_owned_attempt_finish(second)==0); anisette_owned_attempt_release(second);
+    auto *allocation=anisette_owned_attempt_create(lib.c_str(),root.c_str(),id,60000); assert(allocation);
+    std::string allocation_dir=anisette_owned_attempt_directory(allocation);
+    fail_next_allocation=true;
+    assert(anisette_owned_attempt_stage_libraries(allocation,blob,3,blob,3)==ANISETTE_ERR_LOADER_FAILED);
+    assert(!fail_next_allocation);
+    assert(anisette_owned_attempt_stage_libraries(allocation,blob,3,blob,3)!=0);
+    assert(anisette_owned_attempt_finish(allocation)==0 && anisette_owned_attempt_is_quiescent(allocation));
+    assert(!std::filesystem::exists(allocation_dir));
+    anisette_owned_attempt_release(allocation);
     auto *swapped=anisette_owned_attempt_create(lib.c_str(),root.c_str(),id,60000); assert(swapped);
     std::string state=anisette_owned_attempt_directory(swapped);
     std::string owned=std::filesystem::path(state).parent_path(), moved=owned+"-moved";

@@ -155,9 +155,9 @@ void observe_native_checkpoint(const char *checkpoint) {
 // attempt. Every rejected staging operation must leave this whole snapshot
 // unchanged, including a cold VM and previously configured other identities.
 struct NormalState {
-    EmulatorVM *vm=g_shared_vm;
-    bool initialized=g_libraries_initialized;
-    std::string path=g_current_prov_path, id=g_current_android_id, observed=observed_id;
+    EmulatorVM *vm=legacy_vm_state.vm;
+    bool initialized=legacy_vm_state.libraries_initialized;
+    std::string path=legacy_vm_state.provisioning_path, id=legacy_vm_state.android_id, observed=observed_id;
     std::string native_path=vm?vm->provisioning_path:"";
     uint64_t heap_next=vm?vm->heap.next:0;
     std::map<uint64_t,std::vector<uint8_t>> memory=vm?vm->uc->memory:decltype(memory){};
@@ -166,8 +166,8 @@ struct NormalState {
     int symbols=symbol_lookups;
     size_t procedures=normal_procedures.size(), checkpoints=native_checkpoints.size();
     void assert_unchanged() const {
-        assert(g_shared_vm==vm && g_libraries_initialized==initialized);
-        assert(g_current_prov_path==path && g_current_android_id==id && observed_id==observed);
+        assert(legacy_vm_state.vm==vm && legacy_vm_state.libraries_initialized==initialized);
+        assert(legacy_vm_state.provisioning_path==path && legacy_vm_state.android_id==id && observed_id==observed);
         assert(constructed==created && destroyed==deleted && otp_calls==otp && provision_calls==provision);
         assert(library_loads==loads && library_relocations==relocations && library_constructors==constructors);
         assert(symbol_lookups==symbols && normal_procedures.size()==procedures);
@@ -308,11 +308,11 @@ int main(int argc,char **argv) {
     char temporary[]="/tmp/isolated-adi-test-XXXXXX";assert(mkdtemp(temporary));root=temporary;
     uint8_t uuid[16];for(int i=0;i<16;++i)uuid[i]=i;expected_uuid=format_uuid_string(uuid);
     // A warmed normal provider must survive every probe result byte-for-byte.
-    auto normal=new EmulatorVM;g_shared_vm=normal;g_libraries_initialized=true;
-    g_current_prov_path="unchanged-normal-path";g_current_android_id="UNCHANGEDNORMAL";
+    auto normal=new EmulatorVM;legacy_vm_state.vm=normal;legacy_vm_state.libraries_initialized=true;
+    legacy_vm_state.provisioning_path="unchanged-normal-path";legacy_vm_state.android_id="UNCHANGEDNORMAL";
     if (normal_mode && fault == "fresh_constructor_diag") {
         anisetteCoreSetLogging(0);
-        delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;
+        delete normal;legacy_vm_state.vm=nullptr;legacy_vm_state.libraries_initialized=false;
         fault="constructor_diag";
         const uint8_t spim[]={10,11};char *json=nullptr;
         assert(start_provision_uc(root.c_str(),root.c_str(),uuid,spim,sizeof(spim),&json)==ANISETTE_ERR_LOADER_FAILED);
@@ -323,13 +323,13 @@ int main(int argc,char **argv) {
         assert(strstr(json,"\"v3_login_native_trace\":\"v1;"));
         assert(strstr(json,"3,2,") && provision_calls==0 && otp_calls==0);
         free_c_string(json);
-        assert(g_shared_vm && g_shared_vm->initialization_failed);
-        delete g_shared_vm;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+        assert(legacy_vm_state.vm && legacy_vm_state.vm->initialization_failed);
+        delete legacy_vm_state.vm;legacy_vm_state.vm=nullptr;assert(rmdir(root.c_str())==0);
         puts("FRESH_CONSTRUCTOR_TRACE_PASS");return 0;
     }
     if (normal_mode && fault == "constructor_diag") {
         anisetteCoreSetLogging(0);
-        delete normal;g_shared_vm=nullptr;g_libraries_initialized=false;
+        delete normal;legacy_vm_state.vm=nullptr;legacy_vm_state.libraries_initialized=false;
         normal_otp_checks=true;
         char *json=nullptr;
         const std::string directory=root+"/"+expected_uuid;
@@ -351,8 +351,8 @@ int main(int argc,char **argv) {
         assert(first.find("v2|0|0|0")!=std::string::npos);
         assert(first.find(expected_blob)==std::string::npos && first.find(expected_uuid)==std::string::npos);
         assert(first.find(root)==std::string::npos);
-        assert(g_shared_vm && g_shared_vm->initialization_failed && !g_libraries_initialized);
-        assert(g_current_prov_path=="unchanged-normal-path" && g_current_android_id=="UNCHANGEDNORMAL");
+        assert(legacy_vm_state.vm && legacy_vm_state.vm->initialization_failed && !legacy_vm_state.libraries_initialized);
+        assert(legacy_vm_state.provisioning_path=="unchanged-normal-path" && legacy_vm_state.android_id=="UNCHANGEDNORMAL");
         assert(normal_procedures.empty() && otp_calls==0 && provision_calls==0);
         assert(contents(directory+"/adi.pb")==expected_blob && library_constructors==1);
         free_c_string(json);json=nullptr;
@@ -363,7 +363,7 @@ int main(int argc,char **argv) {
         assert(library_constructors==1 && normal_procedures.empty() && otp_calls==0 && provision_calls==0);
         assert(first.find("reason=engine_error;engine=13;library=1;initializer=2")!=std::string::npos);
         assert(contents(directory+"/adi.pb")==expected_blob);
-        free_c_string(json);delete g_shared_vm;g_shared_vm=nullptr;
+        free_c_string(json);delete legacy_vm_state.vm;legacy_vm_state.vm=nullptr;
         assert(unlink((directory+"/adi.pb").c_str())==0 && rmdir(directory.c_str())==0 && rmdir(root.c_str())==0);
         puts("CONSTRUCTOR_DIAGNOSTIC_BOUNDARY_PASS");return 0;
     }
@@ -389,7 +389,7 @@ int main(int argc,char **argv) {
             assert(checked_mkdir_attempts==0 && unchecked_mkdir_attempts==0);
             assert(root_open_attempts==0 && checked_open_attempts==0 && normal_uuid_formats==0);
 
-            delete normal;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+            delete normal;legacy_vm_state.vm=nullptr;assert(rmdir(root.c_str())==0);
             puts("NORMAL_INVALID_ARGUMENT_PASS");return 0;
         }
         const bool cold_failure=fault.rfind("coldfail_",0)==0;
@@ -405,7 +405,7 @@ int main(int argc,char **argv) {
         const bool concurrent=fault=="concurrent", retry=fault=="retrywrite";
         const std::string scenario=fault;
         if(cold) {
-            delete normal;normal=nullptr;g_shared_vm=nullptr;g_libraries_initialized=false;
+            delete normal;normal=nullptr;legacy_vm_state.vm=nullptr;legacy_vm_state.libraries_initialized=false;
         }
         if(fault=="cold" || fault=="fresh" || fault=="cold_new" || same_identity || different_identity || provisioned)fault="ok";
         if(fresh || provisioned)expected_blob="SYNTHETIC-FRESH-PROVISION-BLOB";
@@ -460,12 +460,12 @@ int main(int argc,char **argv) {
             EmulatorVM *configured=nullptr;std::string configured_directory,error;
             assert(setup_vm_and_adi(configured,root.c_str(),root.c_str(),prior_uuid,
                 configured_directory,error));
-            assert(configured==normal && g_libraries_initialized && constructed==1 && destroyed==0);
+            assert(configured==normal && legacy_vm_state.libraries_initialized && constructed==1 && destroyed==0);
             if(different_identity) {
                 prior_identity_directory=configured_directory;
                 std::ofstream old_blob(prior_identity_directory+"/adi.pb");old_blob<<previous;
-                assert(g_current_prov_path!=directory && g_current_android_id!="0001020304050607");
-            } else assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
+                assert(legacy_vm_state.provisioning_path!=directory && legacy_vm_state.android_id!="0001020304050607");
+            } else assert(legacy_vm_state.provisioning_path==directory && legacy_vm_state.android_id=="0001020304050607");
         }
         if(provisioned) {
             synthetic_provision_success=true;
@@ -485,8 +485,8 @@ int main(int argc,char **argv) {
             free_c_string(json);
             assert(contents(destination)==expected_blob && otp_calls==0 && provision_calls==2);
             assert((normal_procedures==std::vector<uint64_t>{1,2,3,5,6}));
-            assert(g_current_prov_path==directory && g_current_android_id=="0001020304050607");
-            assert(constructed==2 && destroyed==1 && g_libraries_initialized);
+            assert(legacy_vm_state.provisioning_path==directory && legacy_vm_state.android_id=="0001020304050607");
+            assert(constructed==2 && destroyed==1 && legacy_vm_state.libraries_initialized);
             assert(library_loads==2 && library_constructors==1 && library_relocations==1);
             // Match the Swift boundary: provisioning returns bytes, its UUID
             // directory can be removed, and OTP must stage them into a new one
@@ -512,7 +512,7 @@ int main(int argc,char **argv) {
             assert(access(temporary_file.c_str(),F_OK)!=0 && !json);
             assert(unlink(destination.c_str())==0 && rmdir(directory.c_str())==0);
             assert(unlink((outside+"/adi.pb").c_str())==0 && rmdir(outside.c_str())==0);
-            delete g_shared_vm;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+            delete legacy_vm_state.vm;legacy_vm_state.vm=nullptr;assert(rmdir(root.c_str())==0);
             puts("NORMAL_ALLOCATION_FD_PASS");return 0;
         }
         auto invoke_normal=[&]() {
@@ -613,10 +613,10 @@ int main(int argc,char **argv) {
         assert(access((outside+"/"+expected_uuid).c_str(),F_OK)!=0);
         assert(provision_calls==before.provision);
         if(promoted) {
-            assert(g_shared_vm && !g_shared_vm->read_only_filesystem);
+            assert(legacy_vm_state.vm && !legacy_vm_state.vm->read_only_filesystem);
             assert(destroyed==before.deleted);
             if(before.vm) {
-                assert(g_shared_vm==before.vm && constructed==before.created);
+                assert(legacy_vm_state.vm==before.vm && constructed==before.created);
                 assert(library_loads==before.loads && library_relocations==before.relocations);
                 assert(library_constructors==before.constructors);
             } else {
@@ -626,7 +626,7 @@ int main(int argc,char **argv) {
                 assert(library_relocations==before.relocations+(fault=="load"?0:1));
                 assert(library_constructors==before.constructors+(fault=="load"?0:1));
             }
-            assert(g_libraries_initialized==(fault!="load" && fault!="setup_init"));
+            assert(legacy_vm_state.libraries_initialized==(fault!="load" && fault!="setup_init"));
             std::vector<uint64_t> expected_procedures;
             if(fault!="load") {
                 if(!before.initialized)expected_procedures.push_back(1);
@@ -645,13 +645,13 @@ int main(int argc,char **argv) {
             assert(actual_procedures==expected_procedures);
             const bool path_succeeded=fault!="load" && fault!="setup_init" && fault!="setup_path";
             const bool id_succeeded=path_succeeded && fault!="setup_id";
-            assert(g_current_prov_path==(path_succeeded?directory:before.path));
-            assert(g_current_android_id==(id_succeeded?"0001020304050607":before.id));
+            assert(legacy_vm_state.provisioning_path==(path_succeeded?directory:before.path));
+            assert(legacy_vm_state.android_id==(id_succeeded?"0001020304050607":before.id));
         }
         if(retry) {
             fault="ok";fired=false;close_count=0;
             assert(invoke_normal()==0 && otp_calls==1 && contents(destination)==expected_blob);
-            assert(g_shared_vm==normal && constructed==1 && destroyed==0);
+            assert(legacy_vm_state.vm==normal && constructed==1 && destroyed==0);
             assert(access(temporary_file.c_str(),F_OK)!=0);
         }
         if(different_identity) {
@@ -672,7 +672,7 @@ int main(int argc,char **argv) {
             assert(rmdir((root+"-detached").c_str())==0);
         }
         assert(unlink((outside+"/adi.pb").c_str())==0);assert(rmdir(outside.c_str())==0);
-        delete g_shared_vm;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+        delete legacy_vm_state.vm;legacy_vm_state.vm=nullptr;assert(rmdir(root.c_str())==0);
         assert(constructed==destroyed);
         puts("NORMAL_NATIVE_TRACE_PASS");return 0;
     }
@@ -690,7 +690,7 @@ int main(int argc,char **argv) {
 #endif
         }
         printf("NATIVE_TRACE=%s\n",native_trace(json).c_str());free_c_string(json);
-        delete normal;g_shared_vm=nullptr;assert(rmdir(root.c_str())==0);
+        delete normal;legacy_vm_state.vm=nullptr;assert(rmdir(root.c_str())==0);
         puts("NATIVE_TRACE_CAP_PASS");return 0;
     }
     if(fault=="existing") {
@@ -728,8 +728,8 @@ int main(int argc,char **argv) {
         };
         std::thread a(invoke),b(invalid);a.join();b.join();
     } else invoke();
-    assert(g_shared_vm==normal && g_libraries_initialized);
-    assert(g_current_prov_path=="unchanged-normal-path" && g_current_android_id=="UNCHANGEDNORMAL");
+    assert(legacy_vm_state.vm==normal && legacy_vm_state.libraries_initialized);
+    assert(legacy_vm_state.provisioning_path=="unchanged-normal-path" && legacy_vm_state.android_id=="UNCHANGEDNORMAL");
     assert(provision_calls==0 && constructed-destroyed==1);
     assert(!g_isolated_otp_logging_suppressed && anisetteCoreIsLoggingEnabled()==1);
     if(otp_calls)assert(observed_id=="0001020304050607");
@@ -739,7 +739,7 @@ int main(int argc,char **argv) {
         assert(rmdir((root+"/"+expected_uuid).c_str())==0);
     }
     else assert(access((root+"/"+expected_uuid).c_str(),F_OK)!=0);
-    delete normal;g_shared_vm=nullptr;assert(constructed==destroyed);
+    delete normal;legacy_vm_state.vm=nullptr;assert(constructed==destroyed);
     assert(rmdir(root.c_str())==0);
     LOG_UC("NORMAL_LOG_RETAINED\n");
     puts("ISOLATED_NATIVE_OTP_PASS");

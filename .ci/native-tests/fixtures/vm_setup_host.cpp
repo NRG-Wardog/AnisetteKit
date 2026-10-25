@@ -44,28 +44,28 @@ int main(){
  }
  fail_at=1;calls=0;EmulatorVM *vm=nullptr;std::string dir,error;
  check(!setup_vm_and_adi(vm,"/tmp","/tmp",nullptr,dir,error,false,nullptr,true));
- check(g_vm_initialization_failed);check(g_shared_vm==nullptr);check(live==0);
+ check(legacy_vm_state.initialization_failed);check(legacy_vm_state.vm==nullptr);check(live==0);
  const int after_failure=calls;fail_at=0;
  check(!setup_vm_and_adi(vm,"/tmp","/tmp",nullptr,dir,error,false,nullptr,true));
  check(calls==after_failure);check(error=="VM initialization previously failed; restart required");
- {IsolatedOTPVM isolated;check(!g_vm_initialization_failed);check(g_shared_vm==isolated.probe.get());}
- check(g_vm_initialization_failed);check(g_shared_vm==nullptr);check(live==0);
- g_vm_initialization_failed=false;calls=0;
+ {IsolatedOTPVM isolated;check(!legacy_vm_state.initialization_failed);check(legacy_vm_state.vm==isolated.probe.get());}
+ check(legacy_vm_state.initialization_failed);check(legacy_vm_state.vm==nullptr);check(live==0);
+ legacy_vm_state.initialization_failed=false;calls=0;
  check(setup_vm_and_adi(vm,"/tmp","/tmp",nullptr,dir,error,false,nullptr,true));
- check(vm==g_shared_vm);check(live==1);
+ check(vm==legacy_vm_state.vm);check(live==1);
  // Failed isolated construction must not disturb populated normal state.
- g_current_prov_path="synthetic-path";g_current_android_id="synthetic-id";
- g_libraries_initialized=true;calls=0;fail_at=2;
+ legacy_vm_state.provisioning_path="synthetic-path";legacy_vm_state.android_id="synthetic-id";
+ legacy_vm_state.libraries_initialized=true;calls=0;fail_at=2;
  bool isolated_threw=false;
  try{IsolatedOTPVM isolated;}catch(const std::exception&){isolated_threw=true;}
- check(isolated_threw);check(g_shared_vm==vm);check(live==1);
- check(!g_vm_initialization_failed);check(g_libraries_initialized);
- check(g_current_prov_path=="synthetic-path");check(g_current_android_id=="synthetic-id");
- delete g_shared_vm;g_shared_vm=nullptr;g_libraries_initialized=false;
+ check(isolated_threw);check(legacy_vm_state.vm==vm);check(live==1);
+ check(!legacy_vm_state.initialization_failed);check(legacy_vm_state.libraries_initialized);
+ check(legacy_vm_state.provisioning_path=="synthetic-path");check(legacy_vm_state.android_id=="synthetic-id");
+ delete legacy_vm_state.vm;legacy_vm_state.vm=nullptr;legacy_vm_state.libraries_initialized=false;
  // A post-open setup failure must also latch and close the partial engine.
  calls=0;fail_at=2;
  check(!setup_vm_and_adi(vm,"/tmp","/tmp",nullptr,dir,error,false,nullptr,true));
- check(g_vm_initialization_failed);check(g_shared_vm==nullptr);check(live==0);
+ check(legacy_vm_state.initialization_failed);check(legacy_vm_state.vm==nullptr);check(live==0);
  const int after_map_failure=calls;fail_at=0;
  check(!setup_vm_and_adi(vm,"/tmp","/tmp",nullptr,dir,error,false,nullptr,true));
  check(calls==after_map_failure);

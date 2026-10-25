@@ -59,7 +59,7 @@ public:
         return -1;
 #endif
     }
-    int open(const std::string &path, int flags, unsigned mode) const {
+    int open_file(const std::string &path, int flags, unsigned mode) const {
 #if !defined(_WIN32) && !defined(_MSC_VER)
         if (operations_.fetch_add(1, std::memory_order_relaxed) >= 256) { errno = EMFILE; return -1; }
         const bool writable = (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
@@ -81,7 +81,7 @@ public:
         (void)path; (void)flags; (void)mode; errno = EPERM; return -1;
 #endif
     }
-    int mkdir(const std::string &path) const {
+    int create_directory(const std::string &path) const {
 #if !defined(_WIN32) && !defined(_MSC_VER)
         if (operations_.fetch_add(1, std::memory_order_relaxed) >= 256) { errno = EMFILE; return -1; }
         Parent p = resolve(path, true); if (p.fd < 0) return -1;
@@ -97,7 +97,7 @@ public:
         (void)path; errno = EPERM; return -1;
 #endif
     }
-    int stat(const std::string &path, struct stat *st) const {
+    int stat_path(const std::string &path, struct stat *st) const {
 #if !defined(_WIN32) && !defined(_MSC_VER)
         if (operations_.fetch_add(1, std::memory_order_relaxed) >= 256) { errno = EMFILE; return -1; }
         Parent p = resolve(path, false); if (p.fd < 0) return -1;

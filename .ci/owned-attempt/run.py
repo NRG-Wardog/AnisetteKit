@@ -24,6 +24,6 @@ with tempfile.TemporaryDirectory(prefix='owned-oda-tests-') as temp:
     run(*common,ROOT/'.ci/owned-attempt/native_api_test.cpp',*sources,'-o',work/'native'); run(work/'native')
     print('PASS: control, filesystem, pinned-header syntax, actual C ABI with mock engine',flush=True)
     if platform.system()=='Darwin':
-        run(*common,ROOT/'.ci/owned-attempt/unicorn_procedure_test.cpp',sources[1],sources[2],work/'libunicorn.a','-o',work/'unicorn'); run(work/'unicorn')
+        run(*common,ROOT/'.ci/owned-attempt/unicorn_procedure_test.cpp',*sources,work/'libunicorn.a','-o',work/'unicorn'); run(work/'unicorn')
         print('PASS: pinned real Unicorn synthetic ARM64 procedures',flush=True)
     else: print('NOT RUN: real Unicorn macOS binary and Swift tests (requires macOS)',flush=True)

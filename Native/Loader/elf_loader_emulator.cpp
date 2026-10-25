@@ -676,7 +676,7 @@ static void hook_open(EmulatorVM *vm) {
 
     int host_flags = linux_to_darwin_open_flags((int)flags);
     if (vm->attempt_control && (!path_complete || path.size() > 4096 || !owned_attempt_poll(vm))) { fail_guest_operation(vm); return; }
-    int host_fd = vm->attempt_filesystem ? vm->attempt_filesystem->open(path, host_flags, static_cast<unsigned>(mode)) : open(path.c_str(), host_flags, (mode_t)mode);
+    int host_fd = vm->attempt_filesystem ? vm->attempt_filesystem->open_file(path, host_flags, static_cast<unsigned>(mode)) : open(path.c_str(), host_flags, (mode_t)mode);
     const int observed_open_errno = host_fd < 0 ? errno : 0;
     struct HostFDGuard {
         int fd;
@@ -802,7 +802,7 @@ static void hook_mkdir(EmulatorVM *vm) {
     if (path_ptr) {
         while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
     }
-    int res = vm->attempt_filesystem ? vm->attempt_filesystem->mkdir(path) : mkdir(path.c_str(), (mode_t)mode);
+    int res = vm->attempt_filesystem ? vm->attempt_filesystem->create_directory(path) : mkdir(path.c_str(), (mode_t)mode);
     if (!vm->attempt_control && res != 0 && errno == EEXIST) {
         res = 0;
         uint32_t zero_err = 0;
@@ -852,7 +852,7 @@ static void hook_lstat(EmulatorVM *vm) {
         while (owned_attempt_poll(vm) && uc_mem_read(vm->uc, path_ptr++, &c, 1) == UC_ERR_OK && c != '\0') { if (vm->attempt_control && path.size() >= 1048576) { fail_guest_operation(vm); return; } path.push_back(c); }
     }
     struct stat host_st;
-    int res = vm->attempt_filesystem ? vm->attempt_filesystem->stat(path, &host_st) : lstat(path.c_str(), &host_st);
+    int res = vm->attempt_filesystem ? vm->attempt_filesystem->stat_path(path, &host_st) : lstat(path.c_str(), &host_st);
     const int observed_lstat_errno = res < 0 ? errno : 0;
     if (res == 0 && stat_buf_ptr != 0) {
         StatLinux linux_st = {0};
@@ -1442,7 +1442,7 @@ bool load_library_to_vm(EmulatorVM *vm, const std::string &file_path, const std:
         FILE *opened = nullptr;
 #if !defined(_WIN32) && !defined(_MSC_VER)
         if (vm->attempt_filesystem) {
-            int fd = vm->attempt_filesystem->open(file_path, O_RDONLY, 0);
+            int fd = vm->attempt_filesystem->open_file(file_path, O_RDONLY, 0);
             if (fd >= 0) { opened = fdopen(fd, "rb"); if (!opened) close(fd); }
         } else
 #endif
